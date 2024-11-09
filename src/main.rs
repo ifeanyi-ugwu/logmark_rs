@@ -1,5 +1,6 @@
 use env_logger;
 use log::{info, LevelFilter};
+use prettytable::{row, Table};
 use slog::{o, Drain, Logger};
 use slog_term;
 use std::time::Instant;
@@ -163,25 +164,36 @@ fn bench_winston_global() -> BenchmarkResult {
 
 fn main() {
     let benchmarks = vec![
-        //bench_env_logger,
-        //bench_slog,
+        bench_env_logger,
+        bench_slog,
         bench_slog_async,
-        //bench_tracing,
+        bench_tracing,
         bench_winston,
         bench_winston_global,
     ];
-    //let benchmarks = vec![bench_slog_async_block];
-    let mut results = Vec::new();
 
-    for bench in benchmarks {
-        let result = bench();
-        println!("Finished benchmarking: \"{}\"", result.name);
-        println!("  Elapsed: {:.4} seconds", result.elapsed);
-        println!("  Ops/sec: {:.4}", result.ops);
-        println!("  Memory Usage: {:.4} MB", result.memory_usage);
-        results.push(result);
+    // Run all benchmarks and collect results
+    let mut results: Vec<_> = benchmarks.into_iter().map(|bench| bench()).collect();
+
+    // Create table for displaying the results
+    let mut table = Table::new();
+    table.add_row(row!["Name", "Elapsed (s)", "Ops/sec", "Memory Usage (MB)"]);
+
+    // Add each result as a row in the table
+    for result in &results {
+        table.add_row(row![
+            result.name,
+            format!("{:.4}", result.elapsed),
+            format!("{:.4}", result.ops),
+            format!("{:.4}", result.memory_usage)
+        ]);
     }
 
+    // Print the table
+    println!("\nBenchmark Results:");
+    table.printstd();
+
+    // Sort and compare results by operations per second
     results.sort_by(|a, b| b.ops.partial_cmp(&a.ops).unwrap());
     println!("\nFastest is {}", results[0].name);
 
