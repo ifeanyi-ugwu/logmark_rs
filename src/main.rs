@@ -30,6 +30,7 @@ fn jemalloc_allocated() -> usize {
 
 const ITERATIONS: u32 = 100_000;
 const NUM_RUNS: usize = 3;
+const NUM_WARMUP_RUNS: usize = 1;
 const MESSAGE: &str = "A logging message that is reasonably long";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -387,6 +388,26 @@ fn run_benchmarks_in_processes(
         .flat_map(|&bench| targets.iter().map(move |&target| (bench, target)))
         .collect();
 
+    for warmup in 1..=NUM_WARMUP_RUNS {
+        println!(
+            "\n-- warmup {} of {}  [{}] --",
+            warmup,
+            NUM_WARMUP_RUNS,
+            Local::now().format("%H:%M:%S")
+        );
+        all_benchmarks.shuffle(&mut rng);
+        for &(bench, target) in &all_benchmarks {
+            println!("  {} ({})", bench, target.as_str());
+            let start = Instant::now();
+            let _ = Command::new(env::current_exe().unwrap())
+                .arg("--benchmark")
+                .arg(bench)
+                .arg(target.as_str())
+                .output();
+            println!("    done  {:.4}s", start.elapsed().as_secs_f64());
+        }
+    }
+
     for run in 1..=runs {
         println!(
             "\n-- run {} of {}  [{}] --",
@@ -677,10 +698,11 @@ fn main() {
     let run_timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
     println!(
-        "logmark  {}  {} loggers × {} targets × {} runs",
+        "logmark  {}  {} loggers × {} targets × {} warmup + {} runs",
         run_timestamp,
         benchmarks.len(),
         targets.len(),
+        NUM_WARMUP_RUNS,
         NUM_RUNS
     );
 
