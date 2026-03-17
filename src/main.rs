@@ -195,9 +195,25 @@ fn bench_slog_async(target: OutputTarget) -> BenchmarkResult {
 
     let root = Logger::root(drain, o!());
 
-    run_benchmark("slog_async", target, move || {
+    // Drop root inside the timed window so the worker-thread join is included.
+    // Without this, the 100K iterations measure enqueue speed only.
+    let before = memory_stats().unwrap();
+    let start = Instant::now();
+    for _ in 0..ITERATIONS {
         slog::info!(root, "{} {}", MESSAGE, "slog_async");
-    })
+    }
+    drop(root);
+    let elapsed = start.elapsed();
+    let after = memory_stats().unwrap();
+
+    BenchmarkResult {
+        name: "slog_async".to_string(),
+        target,
+        elapsed: elapsed.as_secs_f64(),
+        ops: ITERATIONS as f64 / elapsed.as_secs_f64(),
+        memory_usage: after.physical_mem.saturating_sub(before.physical_mem) as f64
+            / (1024.0 * 1024.0),
+    }
 }
 
 fn bench_tracing(target: OutputTarget) -> BenchmarkResult {
@@ -230,7 +246,7 @@ fn bench_tracing_async(target: OutputTarget) -> BenchmarkResult {
 
     const CHANNEL_SIZE: usize = 50_000;
 
-    let (writer, _guard) = match target {
+    let (writer, guard) = match target {
         OutputTarget::Sink => NonBlockingBuilder::default()
             .buffered_lines_limit(CHANNEL_SIZE)
             .lossy(false)
@@ -251,9 +267,25 @@ fn bench_tracing_async(target: OutputTarget) -> BenchmarkResult {
     let subscriber = fmt().json().with_writer(writer).finish();
     tracing::subscriber::set_global_default(subscriber).expect("setting tracing default failed");
 
-    run_benchmark("tracing_async", target, || {
+    // Drop guard inside the timed window — WorkerGuard::drop blocks until the
+    // background thread has flushed all buffered messages.
+    let before = memory_stats().unwrap();
+    let start = Instant::now();
+    for _ in 0..ITERATIONS {
         event!(Level::INFO, "{} {}", MESSAGE, "tracing_async");
-    })
+    }
+    drop(guard);
+    let elapsed = start.elapsed();
+    let after = memory_stats().unwrap();
+
+    BenchmarkResult {
+        name: "tracing_async".to_string(),
+        target,
+        elapsed: elapsed.as_secs_f64(),
+        ops: ITERATIONS as f64 / elapsed.as_secs_f64(),
+        memory_usage: after.physical_mem.saturating_sub(before.physical_mem) as f64
+            / (1024.0 * 1024.0),
+    }
 }
 
 fn bench_winston(target: OutputTarget) -> BenchmarkResult {
@@ -274,9 +306,25 @@ fn bench_winston(target: OutputTarget) -> BenchmarkResult {
         }
     };
 
-    run_benchmark("winston", target, move || {
+    // Drop logger inside the timed window so the internal worker channel is
+    // fully drained before elapsed is captured.
+    let before = memory_stats().unwrap();
+    let start = Instant::now();
+    for _ in 0..ITERATIONS {
         winston::log!(logger, info, format!("{} {}", MESSAGE, "winston"));
-    })
+    }
+    drop(logger);
+    let elapsed = start.elapsed();
+    let after = memory_stats().unwrap();
+
+    BenchmarkResult {
+        name: "winston".to_string(),
+        target,
+        elapsed: elapsed.as_secs_f64(),
+        ops: ITERATIONS as f64 / elapsed.as_secs_f64(),
+        memory_usage: after.physical_mem.saturating_sub(before.physical_mem) as f64
+            / (1024.0 * 1024.0),
+    }
 }
 
 fn run_individual_benchmark(benchmark_name: &str, target_name: &str) -> BenchmarkResult {
