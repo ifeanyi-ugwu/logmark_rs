@@ -424,11 +424,11 @@ fn run_benchmarks_in_processes(
                         stats.memory_usages.push(memory);
 
                         println!(
-                            "    [{}] done  {:.4}s  {}  {:.2}MB",
+                            "    [{}] done  {:.4}s  {}  {}",
                             Local::now().format("%H:%M:%S"),
                             elapsed,
                             fmt_ops(ops),
-                            memory
+                            fmt_mem(memory)
                         );
                     }
                 }
@@ -489,6 +489,17 @@ fn fmt_ops(ops: f64) -> String {
     }
 }
 
+fn fmt_mem(mb: f64) -> String {
+    if mb >= 1.0 {
+        format!("{:.2}MB", mb)
+    } else if mb >= 0.001 {
+        format!("{:.1}KB", mb * 1024.0)
+    } else {
+        let bytes = (mb * 1024.0 * 1024.0).round() as u64;
+        format!("{}B", bytes)
+    }
+}
+
 // Coefficient of variation: stddev / mean. Used to flag unreliable runs.
 fn cov(values: &[f64]) -> f64 {
     let m = mean(values);
@@ -529,11 +540,11 @@ fn print_stats_report(
         }
         writeln!(
             detail,
-            "  median={:.4}s  ±{:.0}%{}  heap=+{:.3}MB",
+            "  median={:.4}s  ±{:.0}%{}  heap=+{}",
             median(&stat.elapsed_times),
             c * 100.0,
             flag,
-            median(&stat.memory_usages),
+            fmt_mem(median(&stat.memory_usages)),
         )
         .unwrap();
     }
