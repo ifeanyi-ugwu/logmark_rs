@@ -449,6 +449,7 @@ dependencies = [
 name = "logmark"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "env_logger",
  "fern",
  "log",

@@ -1,3 +1,4 @@
+use chrono::Local;
 use env_logger;
 use env_logger::fmt::Formatter;
 use log::info;
@@ -326,11 +327,16 @@ fn run_benchmarks_in_processes(
         .collect();
 
     for run in 1..=runs {
-        println!("\n--- Run {} of {} ---", run, runs);
+        println!(
+            "\n-- run {} of {}  [{}] --",
+            run,
+            runs,
+            Local::now().format("%H:%M:%S")
+        );
         all_benchmarks.shuffle(&mut rng);
 
         for &(bench, target) in &all_benchmarks {
-            println!("Starting benchmark: {} ({})", bench, target.as_str());
+            println!("  {} ({})", bench, target.as_str());
 
             let output = Command::new(env::current_exe().unwrap())
                 .arg("--benchmark")
@@ -357,8 +363,11 @@ fn run_benchmarks_in_processes(
                         stats.memory_usages.push(memory);
 
                         println!(
-                            "  {} took {:.4}s, {:.0} ops/sec, {:.4} MB",
-                            name, elapsed, ops, memory
+                            "    [{}] done  {:.4}s  {}  {:.2}MB",
+                            Local::now().format("%H:%M:%S"),
+                            elapsed,
+                            fmt_ops(ops),
+                            memory
                         );
                     }
                 }
@@ -409,122 +418,167 @@ fn std_dev(values: &[f64]) -> f64 {
     variance.sqrt()
 }
 
-fn print_stats_report(stats: &HashMap<String, BenchmarkStats>) {
-    println!("\n===== BENCHMARK STATISTICS =====");
-    println!("(across {} runs for each benchmark)\n", NUM_RUNS);
-
-    println!(
-        "{:<22} | {:<14} | {:<15} | {:<14} | {:<15}",
-        "Logger", "Avg Time (s)", "Median Time (s)", "Avg Ops/sec", "Avg Memory (MB)"
-    );
-    println!(
-        "{:-<22} | {:-<14} | {:-<15} | {:-<14} | {:-<15}",
-        "", "", "", "", ""
-    );
-
-    let mut logger_names: Vec<_> = stats.keys().collect();
-    logger_names.sort();
-
-    for name in &logger_names {
-        let stat = &stats[*name];
-        println!(
-            "{:<22} | {:<14.4} | {:<15.4} | {:<14.0} | {:<15.4}",
-            name,
-            mean(&stat.elapsed_times),
-            median(&stat.elapsed_times),
-            mean(&stat.ops_rates),
-            mean(&stat.memory_usages),
-        );
+fn fmt_ops(ops: f64) -> String {
+    if ops >= 1_000_000.0 {
+        format!("{:.2}M", ops / 1_000_000.0)
+    } else if ops >= 1_000.0 {
+        format!("{:.1}K", ops / 1_000.0)
+    } else {
+        format!("{:.0}", ops)
     }
-
-    let mut file = fs::File::create("benchmark_results/detailed_stats.txt").unwrap();
-    writeln!(file, "Detailed Benchmark Statistics").unwrap();
-    writeln!(file, "==========================\n").unwrap();
-
-    for name in stats.keys() {
-        let stat = &stats[name];
-        writeln!(file, "Logger: {}", name).unwrap();
-        writeln!(file, "  Elapsed Time (s):").unwrap();
-        writeln!(file, "    Values: {:?}", stat.elapsed_times).unwrap();
-        writeln!(file, "    Mean:   {:.4}", mean(&stat.elapsed_times)).unwrap();
-        writeln!(file, "    Median: {:.4}", median(&stat.elapsed_times)).unwrap();
-        writeln!(file, "    StdDev: {:.4}", std_dev(&stat.elapsed_times)).unwrap();
-        writeln!(file, "  Operations/sec:").unwrap();
-        writeln!(file, "    Values: {:?}", stat.ops_rates).unwrap();
-        writeln!(file, "    Mean:   {:.4}", mean(&stat.ops_rates)).unwrap();
-        writeln!(file, "    Median: {:.4}", median(&stat.ops_rates)).unwrap();
-        writeln!(file, "    StdDev: {:.4}", std_dev(&stat.ops_rates)).unwrap();
-        writeln!(file, "  Memory Usage (MB):").unwrap();
-        writeln!(file, "    Values: {:?}", stat.memory_usages).unwrap();
-        writeln!(file, "    Mean:   {:.4}", mean(&stat.memory_usages)).unwrap();
-        writeln!(file, "    Median: {:.4}", median(&stat.memory_usages)).unwrap();
-        writeln!(file, "    StdDev: {:.4}", std_dev(&stat.memory_usages)).unwrap();
-        writeln!(file).unwrap();
-    }
-
-    println!("\nDetailed statistics written to benchmark_results/detailed_stats.txt");
-    generate_target_summaries(stats);
 }
 
-fn generate_target_summaries(stats: &HashMap<String, BenchmarkStats>) {
-    let mut target_groups: HashMap<&str, Vec<(&str, &BenchmarkStats)>> = HashMap::new();
+// Coefficient of variation: stddev / mean. Used to flag unreliable runs.
+fn cov(values: &[f64]) -> f64 {
+    let m = mean(values);
+    if m == 0.0 {
+        return 0.0;
+    }
+    std_dev(values) / m
+}
 
-    for (name, stat) in stats {
-        if let Some((logger, target)) = name.rsplit_once('_') {
-            target_groups
-                .entry(target)
-                .or_default()
-                .push((logger, stat));
+fn print_stats_report(
+    stats: &HashMap<String, BenchmarkStats>,
+    run_timestamp: &str,
+    logger_count: usize,
+) {
+    let sep = "─".repeat(65);
+    println!("\n{sep}");
+    println!("  logmark  {run_timestamp}");
+    println!("  {logger_count} loggers × 3 targets × {NUM_RUNS} runs × {ITERATIONS} iterations");
+    println!("{sep}");
+
+    // Write detailed per-run file (all entries, sorted alphabetically).
+    let mut detail = fs::File::create("benchmark_results/detailed_stats.txt").unwrap();
+    writeln!(detail, "logmark  {run_timestamp}").unwrap();
+    writeln!(
+        detail,
+        "{logger_count} loggers × 3 targets × {NUM_RUNS} runs × {ITERATIONS} iterations\n"
+    )
+    .unwrap();
+    let mut all_names: Vec<&String> = stats.keys().collect();
+    all_names.sort();
+    for name in &all_names {
+        let stat = &stats[*name];
+        let c = cov(&stat.elapsed_times);
+        let flag = if c > 0.25 { " [!]" } else { "" };
+        write!(detail, "{:<26}", name).unwrap();
+        for (i, t) in stat.elapsed_times.iter().enumerate() {
+            write!(detail, "  run{}={:.4}s", i + 1, t).unwrap();
         }
+        writeln!(
+            detail,
+            "  median={:.4}s  ±{:.0}%{}",
+            median(&stat.elapsed_times),
+            c * 100.0,
+            flag
+        )
+        .unwrap();
     }
 
-    for (target, loggers) in target_groups {
-        let mut file =
-            fs::File::create(format!("benchmark_results/{}_summary.txt", target)).unwrap();
-        writeln!(
-            file,
-            "Performance Summary for {} Target",
-            target.to_uppercase()
-        )
-        .unwrap();
-        writeln!(file, "=======================================\n").unwrap();
-        writeln!(
-            file,
-            "{:<20} | {:<14} | {:<14} | {:<15}",
-            "Logger", "Avg Time (s)", "Avg Ops/sec", "Avg Memory (MB)"
-        )
-        .unwrap();
-        writeln!(
-            file,
-            "{:-<20} | {:-<14} | {:-<14} | {:-<15}",
-            "", "", "", ""
-        )
-        .unwrap();
+    // Console tables and per-target summary files, grouped by target.
+    for target in &["sink", "stdout", "file"] {
+        let mut group: Vec<(&str, &BenchmarkStats)> = stats
+            .iter()
+            .filter_map(|(name, stat)| {
+                name.rsplit_once('_')
+                    .filter(|(_, t)| t == target)
+                    .map(|(logger, _)| (logger, stat))
+            })
+            .collect();
 
-        let mut sorted_loggers = loggers.clone();
-        sorted_loggers.sort_by(|(_, a), (_, b)| {
-            mean(&a.elapsed_times)
-                .partial_cmp(&mean(&b.elapsed_times))
+        if group.is_empty() {
+            continue;
+        }
+
+        // Fastest first.
+        group.sort_by(|(_, a), (_, b)| {
+            median(&b.ops_rates)
+                .partial_cmp(&median(&a.ops_rates))
                 .unwrap()
         });
 
-        for (logger, stat) in sorted_loggers {
-            writeln!(
-                file,
-                "{:<20} | {:<14.4} | {:<14.0} | {:<15.4}",
+        let best_ops = median(&group[0].1.ops_rates);
+
+        println!("\n  ── {} ", target.to_uppercase());
+        println!(
+            "  {:>2}  {:<16}  {:>12}  {:>11}  {:>7}  {}",
+            "#", "logger", "median ops/s", "median time", "vs best", "var"
+        );
+        println!(
+            "  {:>2}  {:<16}  {:>12}  {:>11}  {:>7}  {}",
+            "", "────────────────", "────────────", "───────────", "───────", "───"
+        );
+
+        let mut any_flagged = false;
+        for (rank, (logger, stat)) in group.iter().enumerate() {
+            let med_ops = median(&stat.ops_rates);
+            let med_time = median(&stat.elapsed_times);
+            let vs = best_ops / med_ops;
+            let c = cov(&stat.elapsed_times);
+            let flag = if c > 0.25 { " [!]" } else { "" };
+            if c > 0.25 {
+                any_flagged = true;
+            }
+            println!(
+                "  {:>2}  {:<16}  {:>12}  {:>11}  {:>7}  ±{:.0}%{}",
+                rank + 1,
                 logger,
-                mean(&stat.elapsed_times),
-                mean(&stat.ops_rates),
-                mean(&stat.memory_usages),
+                fmt_ops(med_ops),
+                format!("{:.4}s", med_time),
+                format!("{:.1}×", vs),
+                c * 100.0,
+                flag,
+            );
+        }
+
+        if any_flagged {
+            println!("      [!] CoV > 25% — high variance; median is more reliable than mean");
+        }
+
+        // Per-target summary file mirrors the console table.
+        let path = format!("benchmark_results/{target}_summary.txt");
+        let mut f = fs::File::create(&path).unwrap();
+        writeln!(f, "logmark  {target} target  {run_timestamp}").unwrap();
+        writeln!(
+            f,
+            "{logger_count} loggers × {NUM_RUNS} runs × {ITERATIONS} iterations\n"
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "  {:>2}  {:<16}  {:>12}  {:>11}  {:>7}  {}",
+            "#", "logger", "median ops/s", "median time", "vs best", "var"
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "  {:>2}  {:<16}  {:>12}  {:>11}  {:>7}  {}",
+            "", "────────────────", "────────────", "───────────", "───────", "───"
+        )
+        .unwrap();
+        for (rank, (logger, stat)) in group.iter().enumerate() {
+            let med_ops = median(&stat.ops_rates);
+            let med_time = median(&stat.elapsed_times);
+            let vs = best_ops / med_ops;
+            let c = cov(&stat.elapsed_times);
+            let flag = if c > 0.25 { " [!]" } else { "" };
+            writeln!(
+                f,
+                "  {:>2}  {:<16}  {:>12}  {:>11}  {:>7}  ±{:.0}%{}",
+                rank + 1,
+                logger,
+                fmt_ops(med_ops),
+                format!("{:.4}s", med_time),
+                format!("{:.1}×", vs),
+                c * 100.0,
+                flag,
             )
             .unwrap();
         }
-
-        println!(
-            "Summary for {} target written to benchmark_results/{}_summary.txt",
-            target, target
-        );
     }
+
+    println!("\nResults written to benchmark_results/");
 }
 
 fn main() {
@@ -547,11 +601,16 @@ fn main() {
     ];
 
     let targets = OutputTarget::all();
+    let run_timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
     println!(
-        "Running each benchmark with each target {} times in randomized order...",
+        "logmark  {}  {} loggers × {} targets × {} runs",
+        run_timestamp,
+        benchmarks.len(),
+        targets.len(),
         NUM_RUNS
     );
+
     let stats = run_benchmarks_in_processes(&benchmarks, &targets, NUM_RUNS);
-    print_stats_report(&stats);
+    print_stats_report(&stats, &run_timestamp, benchmarks.len());
 }
