@@ -8,8 +8,8 @@ chrono = { version = "0.4", features = ["clock"] }
 env_logger = "0.11.5"
 fern = "0.6.2"
 log = "0.4.22"
-memory-stats = "1.2.0"
 rand = "0.8.5"
+tikv-jemalloc-ctl = { version = "0.6.0", features = ["stats"] }
 slog = "2.7.0"
 slog-async = "2.8.0"
 slog-json = "2.6.1"
@@ -19,6 +19,9 @@ tracing-appender = "0.2.3"
 tracing-subscriber = { version = "0.3", features = ["fmt", "json"] }
 winston = { version = "0.8.0", path = "../winston_logger/winston" }
 winston_transport = "0.6.0"
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6.0"
 
 [profile.bench]
 debug = true

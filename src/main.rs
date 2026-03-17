@@ -2,7 +2,6 @@ use chrono::Local;
 use env_logger;
 use env_logger::fmt::Formatter;
 use log::info;
-use memory_stats::memory_stats;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use slog::{o, Drain, Logger};
@@ -14,6 +13,20 @@ use std::process::{exit, Command};
 use std::time::Instant;
 use std::{env, fs, thread};
 use tracing::{event, Level};
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// Returns the number of bytes currently allocated on the heap according to
+/// jemalloc. Advances the stats epoch first so the read is current.
+fn jemalloc_allocated() -> usize {
+    tikv_jemalloc_ctl::epoch::mib().unwrap().advance().unwrap();
+    tikv_jemalloc_ctl::stats::allocated::mib()
+        .unwrap()
+        .read()
+        .unwrap()
+}
 
 const ITERATIONS: u32 = 100_000;
 const NUM_RUNS: usize = 3;
@@ -56,19 +69,19 @@ struct BenchmarkStats {
 }
 
 fn run_benchmark<F: Fn()>(name: &str, target: OutputTarget, bench_fn: F) -> BenchmarkResult {
-    let before = memory_stats().unwrap();
+    let before = jemalloc_allocated();
     let start = Instant::now();
     for _ in 0..ITERATIONS {
         bench_fn();
     }
     let elapsed = start.elapsed();
-    let after = memory_stats().unwrap();
+    let after = jemalloc_allocated();
     BenchmarkResult {
         name: name.to_string(),
         target,
         elapsed: elapsed.as_secs_f64(),
         ops: ITERATIONS as f64 / elapsed.as_secs_f64(),
-        memory_usage: after.physical_mem.saturating_sub(before.physical_mem) as f64
+        memory_usage: after.saturating_sub(before) as f64
             / (1024.0 * 1024.0),
     }
 }
@@ -197,21 +210,21 @@ fn bench_slog_async(target: OutputTarget) -> BenchmarkResult {
 
     // Drop root inside the timed window so the worker-thread join is included.
     // Without this, the 100K iterations measure enqueue speed only.
-    let before = memory_stats().unwrap();
+    let before = jemalloc_allocated();
     let start = Instant::now();
     for _ in 0..ITERATIONS {
         slog::info!(root, "{} {}", MESSAGE, "slog_async");
     }
     drop(root);
     let elapsed = start.elapsed();
-    let after = memory_stats().unwrap();
+    let after = jemalloc_allocated();
 
     BenchmarkResult {
         name: "slog_async".to_string(),
         target,
         elapsed: elapsed.as_secs_f64(),
         ops: ITERATIONS as f64 / elapsed.as_secs_f64(),
-        memory_usage: after.physical_mem.saturating_sub(before.physical_mem) as f64
+        memory_usage: after.saturating_sub(before) as f64
             / (1024.0 * 1024.0),
     }
 }
@@ -269,21 +282,21 @@ fn bench_tracing_async(target: OutputTarget) -> BenchmarkResult {
 
     // Drop guard inside the timed window — WorkerGuard::drop blocks until the
     // background thread has flushed all buffered messages.
-    let before = memory_stats().unwrap();
+    let before = jemalloc_allocated();
     let start = Instant::now();
     for _ in 0..ITERATIONS {
         event!(Level::INFO, "{} {}", MESSAGE, "tracing_async");
     }
     drop(guard);
     let elapsed = start.elapsed();
-    let after = memory_stats().unwrap();
+    let after = jemalloc_allocated();
 
     BenchmarkResult {
         name: "tracing_async".to_string(),
         target,
         elapsed: elapsed.as_secs_f64(),
         ops: ITERATIONS as f64 / elapsed.as_secs_f64(),
-        memory_usage: after.physical_mem.saturating_sub(before.physical_mem) as f64
+        memory_usage: after.saturating_sub(before) as f64
             / (1024.0 * 1024.0),
     }
 }
@@ -308,21 +321,21 @@ fn bench_winston(target: OutputTarget) -> BenchmarkResult {
 
     // Drop logger inside the timed window so the internal worker channel is
     // fully drained before elapsed is captured.
-    let before = memory_stats().unwrap();
+    let before = jemalloc_allocated();
     let start = Instant::now();
     for _ in 0..ITERATIONS {
         winston::log!(logger, info, format!("{} {}", MESSAGE, "winston"));
     }
     drop(logger);
     let elapsed = start.elapsed();
-    let after = memory_stats().unwrap();
+    let after = jemalloc_allocated();
 
     BenchmarkResult {
         name: "winston".to_string(),
         target,
         elapsed: elapsed.as_secs_f64(),
         ops: ITERATIONS as f64 / elapsed.as_secs_f64(),
-        memory_usage: after.physical_mem.saturating_sub(before.physical_mem) as f64
+        memory_usage: after.saturating_sub(before) as f64
             / (1024.0 * 1024.0),
     }
 }
@@ -516,10 +529,11 @@ fn print_stats_report(
         }
         writeln!(
             detail,
-            "  median={:.4}s  ±{:.0}%{}",
+            "  median={:.4}s  ±{:.0}%{}  heap=+{:.3}MB",
             median(&stat.elapsed_times),
             c * 100.0,
-            flag
+            flag,
+            median(&stat.memory_usages),
         )
         .unwrap();
     }
