@@ -29,6 +29,7 @@ fn jemalloc_allocated() -> usize {
 }
 
 const ITERATIONS: u32 = 100_000;
+const LATENCY_ITERATIONS: usize = 10_000;
 const NUM_RUNS: usize = 3;
 const NUM_WARMUP_RUNS: usize = 1;
 const MESSAGE: &str = "A logging message that is reasonably long";
@@ -60,6 +61,10 @@ struct BenchmarkResult {
     ops: f64,
     memory_usage: f64,
     target: OutputTarget,
+    p50_ns: u64,
+    p99_ns: u64,
+    p999_ns: u64,
+    max_ns: u64,
 }
 
 #[derive(Default)]
@@ -67,9 +72,35 @@ struct BenchmarkStats {
     elapsed_times: Vec<f64>,
     ops_rates: Vec<f64>,
     memory_usages: Vec<f64>,
+    p50_ns: Vec<u64>,
+    p99_ns: Vec<u64>,
+    p999_ns: Vec<u64>,
+    max_ns: Vec<u64>,
+}
+
+/// Computes P50 / P99 / P99.9 / max from a pre-sorted nanosecond sample slice.
+fn latency_percentiles(sorted: &[u64]) -> (u64, u64, u64, u64) {
+    let n = sorted.len();
+    (
+        sorted[n / 2],
+        sorted[n * 99 / 100],
+        sorted[(n * 999 / 1000).min(n - 1)],
+        *sorted.last().unwrap(),
+    )
 }
 
 fn run_benchmark<F: Fn()>(name: &str, target: OutputTarget, bench_fn: F) -> BenchmarkResult {
+    // Latency pass: 10K timed individual calls, results discarded for throughput stats.
+    let mut samples = vec![0u64; LATENCY_ITERATIONS];
+    for slot in samples.iter_mut() {
+        let t = Instant::now();
+        bench_fn();
+        *slot = t.elapsed().as_nanos() as u64;
+    }
+    samples.sort_unstable();
+    let (p50, p99, p999, max) = latency_percentiles(&samples);
+
+    // Throughput pass: 100K calls, wall-clock only.
     let before = jemalloc_allocated();
     let start = Instant::now();
     for _ in 0..ITERATIONS {
@@ -77,13 +108,17 @@ fn run_benchmark<F: Fn()>(name: &str, target: OutputTarget, bench_fn: F) -> Benc
     }
     let elapsed = start.elapsed();
     let after = jemalloc_allocated();
+
     BenchmarkResult {
         name: name.to_string(),
         target,
         elapsed: elapsed.as_secs_f64(),
         ops: ITERATIONS as f64 / elapsed.as_secs_f64(),
-        memory_usage: after.saturating_sub(before) as f64
-            / (1024.0 * 1024.0),
+        memory_usage: after.saturating_sub(before) as f64 / (1024.0 * 1024.0),
+        p50_ns: p50,
+        p99_ns: p99,
+        p999_ns: p999,
+        max_ns: max,
     }
 }
 
@@ -209,8 +244,17 @@ fn bench_slog_async(target: OutputTarget) -> BenchmarkResult {
 
     let root = Logger::root(drain, o!());
 
-    // Drop root inside the timed window so the worker-thread join is included.
-    // Without this, the 100K iterations measure enqueue speed only.
+    // Latency pass: enqueue latency (caller's view, no drain per call).
+    let mut samples = vec![0u64; LATENCY_ITERATIONS];
+    for slot in samples.iter_mut() {
+        let t = Instant::now();
+        slog::info!(root, "{} {}", MESSAGE, "slog_async");
+        *slot = t.elapsed().as_nanos() as u64;
+    }
+    samples.sort_unstable();
+    let (p50, p99, p999, max) = latency_percentiles(&samples);
+
+    // Throughput pass: includes drain (worker-thread join) in elapsed.
     let before = jemalloc_allocated();
     let start = Instant::now();
     for _ in 0..ITERATIONS {
@@ -225,8 +269,11 @@ fn bench_slog_async(target: OutputTarget) -> BenchmarkResult {
         target,
         elapsed: elapsed.as_secs_f64(),
         ops: ITERATIONS as f64 / elapsed.as_secs_f64(),
-        memory_usage: after.saturating_sub(before) as f64
-            / (1024.0 * 1024.0),
+        memory_usage: after.saturating_sub(before) as f64 / (1024.0 * 1024.0),
+        p50_ns: p50,
+        p99_ns: p99,
+        p999_ns: p999,
+        max_ns: max,
     }
 }
 
@@ -281,8 +328,17 @@ fn bench_tracing_async(target: OutputTarget) -> BenchmarkResult {
     let subscriber = fmt().json().with_writer(writer).finish();
     tracing::subscriber::set_global_default(subscriber).expect("setting tracing default failed");
 
-    // Drop guard inside the timed window — WorkerGuard::drop blocks until the
-    // background thread has flushed all buffered messages.
+    // Latency pass: enqueue latency (caller's view, no drain per call).
+    let mut samples = vec![0u64; LATENCY_ITERATIONS];
+    for slot in samples.iter_mut() {
+        let t = Instant::now();
+        event!(Level::INFO, "{} {}", MESSAGE, "tracing_async");
+        *slot = t.elapsed().as_nanos() as u64;
+    }
+    samples.sort_unstable();
+    let (p50, p99, p999, max) = latency_percentiles(&samples);
+
+    // Throughput pass: WorkerGuard::drop blocks until background thread flushes.
     let before = jemalloc_allocated();
     let start = Instant::now();
     for _ in 0..ITERATIONS {
@@ -297,8 +353,11 @@ fn bench_tracing_async(target: OutputTarget) -> BenchmarkResult {
         target,
         elapsed: elapsed.as_secs_f64(),
         ops: ITERATIONS as f64 / elapsed.as_secs_f64(),
-        memory_usage: after.saturating_sub(before) as f64
-            / (1024.0 * 1024.0),
+        memory_usage: after.saturating_sub(before) as f64 / (1024.0 * 1024.0),
+        p50_ns: p50,
+        p99_ns: p99,
+        p999_ns: p999,
+        max_ns: max,
     }
 }
 
@@ -320,8 +379,17 @@ fn bench_winston(target: OutputTarget) -> BenchmarkResult {
         }
     };
 
-    // Drop logger inside the timed window so the internal worker channel is
-    // fully drained before elapsed is captured.
+    // Latency pass: enqueue latency (caller's view, no drain per call).
+    let mut samples = vec![0u64; LATENCY_ITERATIONS];
+    for slot in samples.iter_mut() {
+        let t = Instant::now();
+        winston::log!(logger, info, format!("{} {}", MESSAGE, "winston"));
+        *slot = t.elapsed().as_nanos() as u64;
+    }
+    samples.sort_unstable();
+    let (p50, p99, p999, max) = latency_percentiles(&samples);
+
+    // Throughput pass: drop flushes the internal worker channel.
     let before = jemalloc_allocated();
     let start = Instant::now();
     for _ in 0..ITERATIONS {
@@ -336,8 +404,11 @@ fn bench_winston(target: OutputTarget) -> BenchmarkResult {
         target,
         elapsed: elapsed.as_secs_f64(),
         ops: ITERATIONS as f64 / elapsed.as_secs_f64(),
-        memory_usage: after.saturating_sub(before) as f64
-            / (1024.0 * 1024.0),
+        memory_usage: after.saturating_sub(before) as f64 / (1024.0 * 1024.0),
+        p50_ns: p50,
+        p99_ns: p99,
+        p999_ns: p999,
+        max_ns: max,
     }
 }
 
@@ -361,12 +432,16 @@ fn run_individual_benchmark(benchmark_name: &str, target_name: &str) -> Benchmar
     };
 
     println!(
-        "LOGMARK: {} {} {:.4} {:.4} {:.4}",
+        "LOGMARK: {} {} {:.4} {:.4} {:.4} {} {} {} {}",
         result.name,
         result.target.as_str(),
         result.elapsed,
         result.ops,
-        result.memory_usage
+        result.memory_usage,
+        result.p50_ns,
+        result.p99_ns,
+        result.p999_ns,
+        result.max_ns,
     );
 
     result
@@ -433,16 +508,24 @@ fn run_benchmarks_in_processes(
                 if let Some(line) = output_str.lines().find(|l| l.starts_with("LOGMARK: ")) {
                     let result_parts: Vec<&str> =
                         line["LOGMARK: ".len()..].split_whitespace().collect();
-                    if result_parts.len() >= 5 {
+                    if result_parts.len() >= 9 {
                         let name = format!("{}_{}", result_parts[0], result_parts[1]);
                         let elapsed: f64 = result_parts[2].parse().unwrap();
                         let ops: f64 = result_parts[3].parse().unwrap();
                         let memory: f64 = result_parts[4].parse().unwrap();
+                        let p50: u64 = result_parts[5].parse().unwrap();
+                        let p99: u64 = result_parts[6].parse().unwrap();
+                        let p999: u64 = result_parts[7].parse().unwrap();
+                        let max: u64 = result_parts[8].parse().unwrap();
 
                         let stats = results.entry(name.clone()).or_default();
                         stats.elapsed_times.push(elapsed);
                         stats.ops_rates.push(ops);
                         stats.memory_usages.push(memory);
+                        stats.p50_ns.push(p50);
+                        stats.p99_ns.push(p99);
+                        stats.p999_ns.push(p999);
+                        stats.max_ns.push(max);
 
                         println!(
                             "    [{}] done  {:.4}s  {}  {}",
@@ -507,6 +590,25 @@ fn fmt_ops(ops: f64) -> String {
         format!("{:.1}K", ops / 1_000.0)
     } else {
         format!("{:.0}", ops)
+    }
+}
+
+fn median_u64(values: &[u64]) -> u64 {
+    if values.is_empty() {
+        return 0;
+    }
+    let mut s = values.to_vec();
+    s.sort_unstable();
+    s[s.len() / 2]
+}
+
+fn fmt_latency(ns: u64) -> String {
+    if ns < 1_000 {
+        format!("{}ns", ns)
+    } else if ns < 1_000_000 {
+        format!("{:.1}µs", ns as f64 / 1_000.0)
+    } else {
+        format!("{:.1}ms", ns as f64 / 1_000_000.0)
     }
 }
 
@@ -669,6 +771,51 @@ fn print_stats_report(
                 flag,
             )
             .unwrap();
+        }
+    }
+
+    // Latency tables — one per target, sorted by P99 ascending.
+    println!("\n{sep}");
+    println!("  latency  ({LATENCY_ITERATIONS} samples per run, nanosecond resolution)");
+    println!("  async loggers show enqueue latency; sync loggers show write latency");
+    println!("{sep}");
+
+    for target in &["sink", "stdout", "file"] {
+        let mut group: Vec<(&str, &BenchmarkStats)> = stats
+            .iter()
+            .filter_map(|(name, stat)| {
+                name.rsplit_once('_')
+                    .filter(|(_, t)| t == target)
+                    .map(|(logger, _)| (logger, stat))
+            })
+            .collect();
+
+        if group.is_empty() {
+            continue;
+        }
+
+        group.sort_by_key(|(_, s)| median_u64(&s.p99_ns));
+
+        println!("\n  ── {} ", target.to_uppercase());
+        println!(
+            "  {:>2}  {:<16}  {:>9}  {:>9}  {:>9}  {:>9}",
+            "#", "logger", "P50", "P99", "P99.9", "max"
+        );
+        println!(
+            "  {:>2}  {:<16}  {:>9}  {:>9}  {:>9}  {:>9}",
+            "", "────────────────", "─────────", "─────────", "─────────", "─────────"
+        );
+
+        for (rank, (logger, stat)) in group.iter().enumerate() {
+            println!(
+                "  {:>2}  {:<16}  {:>9}  {:>9}  {:>9}  {:>9}",
+                rank + 1,
+                logger,
+                fmt_latency(median_u64(&stat.p50_ns)),
+                fmt_latency(median_u64(&stat.p99_ns)),
+                fmt_latency(median_u64(&stat.p999_ns)),
+                fmt_latency(median_u64(&stat.max_ns)),
+            );
         }
     }
 
