@@ -471,7 +471,10 @@ fn generate_target_summaries(stats: &HashMap<String, BenchmarkStats>) {
 
     for (name, stat) in stats {
         if let Some((logger, target)) = name.rsplit_once('_') {
-            target_groups.entry(target).or_default().push((logger, stat));
+            target_groups
+                .entry(target)
+                .or_default()
+                .push((logger, stat));
         }
     }
 
