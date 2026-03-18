@@ -6,7 +6,6 @@ use rand::seq::SliceRandom;
 use rand::thread_rng;
 use slog::{o, Drain, Logger, KV};
 use slog_async;
-use slog_term;
 use std::collections::HashMap;
 use std::io::Write;
 use std::process::{exit, Command};
@@ -291,33 +290,22 @@ fn bench_slog(target: OutputTarget) -> BenchmarkResult {
 fn bench_slog_async(target: OutputTarget) -> BenchmarkResult {
     const CHANNEL_SIZE: usize = 50_000;
 
+    macro_rules! async_drain {
+        ($w:expr) => {
+            slog_async::Async::new(PrebufDrain::new($w).fuse())
+                .chan_size(CHANNEL_SIZE)
+                .overflow_strategy(slog_async::OverflowStrategy::Block)
+                .build()
+                .fuse()
+        };
+    }
+
     let drain = match target {
-        OutputTarget::Sink => {
-            let decorator = slog_term::PlainSyncDecorator::new(std::io::sink());
-            let drain = slog_term::FullFormat::new(decorator).build().fuse();
-            slog_async::Async::new(drain)
-                .chan_size(CHANNEL_SIZE)
-                .overflow_strategy(slog_async::OverflowStrategy::Block)
-                .build()
-                .fuse()
-        }
-        OutputTarget::Stdout => {
-            let decorator = slog_term::PlainSyncDecorator::new(std::io::stdout());
-            let drain = slog_term::FullFormat::new(decorator).build().fuse();
-            slog_async::Async::new(drain)
-                .chan_size(CHANNEL_SIZE)
-                .overflow_strategy(slog_async::OverflowStrategy::Block)
-                .build()
-                .fuse()
-        }
+        OutputTarget::Sink => async_drain!(std::io::sink()),
+        OutputTarget::Stdout => async_drain!(std::io::stdout()),
         OutputTarget::File => {
             let log_file = std::fs::File::create("logs/slog_async.log").unwrap();
-            let drain = slog_json::Json::default(log_file).fuse();
-            slog_async::Async::new(drain)
-                .chan_size(CHANNEL_SIZE)
-                .overflow_strategy(slog_async::OverflowStrategy::Block)
-                .build()
-                .fuse()
+            async_drain!(log_file)
         }
     };
 
@@ -564,33 +552,22 @@ fn bench_slog_concurrent(target: OutputTarget) -> (f64, u64) {
 
 fn bench_slog_async_concurrent(target: OutputTarget) -> (f64, u64) {
     const CHANNEL_SIZE: usize = 200_000;
+    macro_rules! async_drain {
+        ($w:expr) => {
+            slog_async::Async::new(PrebufDrain::new($w).fuse())
+                .chan_size(CHANNEL_SIZE)
+                .overflow_strategy(slog_async::OverflowStrategy::Block)
+                .build()
+                .fuse()
+        };
+    }
+
     let drain = match target {
-        OutputTarget::Sink => {
-            let decorator = slog_term::PlainSyncDecorator::new(std::io::sink());
-            let drain = slog_term::FullFormat::new(decorator).build().fuse();
-            slog_async::Async::new(drain)
-                .chan_size(CHANNEL_SIZE)
-                .overflow_strategy(slog_async::OverflowStrategy::Block)
-                .build()
-                .fuse()
-        }
-        OutputTarget::Stdout => {
-            let decorator = slog_term::PlainSyncDecorator::new(std::io::stdout());
-            let drain = slog_term::FullFormat::new(decorator).build().fuse();
-            slog_async::Async::new(drain)
-                .chan_size(CHANNEL_SIZE)
-                .overflow_strategy(slog_async::OverflowStrategy::Block)
-                .build()
-                .fuse()
-        }
+        OutputTarget::Sink => async_drain!(std::io::sink()),
+        OutputTarget::Stdout => async_drain!(std::io::stdout()),
         OutputTarget::File => {
             let log_file = std::fs::File::create("logs/slog_async_conc.log").unwrap();
-            let drain = slog_json::Json::default(log_file).fuse();
-            slog_async::Async::new(drain)
-                .chan_size(CHANNEL_SIZE)
-                .overflow_strategy(slog_async::OverflowStrategy::Block)
-                .build()
-                .fuse()
+            async_drain!(log_file)
         }
     };
     let root = Logger::root(drain, o!());
