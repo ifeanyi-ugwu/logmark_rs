@@ -7,7 +7,7 @@ use rand::thread_rng;
 use slog::{o, Drain, Logger, KV};
 use slog_async;
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::process::{exit, Command};
 use std::time::Instant;
 use std::sync::{Arc, Barrier, Mutex};
@@ -441,7 +441,7 @@ fn bench_winston(target: OutputTarget) -> BenchmarkResult {
         OutputTarget::File => {
             let log_file = std::fs::File::create("logs/winston.log").unwrap();
             builder
-                .transport(winston::transports::WriterTransport::new(log_file))
+                .transport(winston::transports::WriterTransport::new(BufWriter::new(log_file)))
                 .build()
         }
     };
@@ -636,7 +636,7 @@ fn bench_winston_concurrent(target: OutputTarget) -> (f64, u64) {
         OutputTarget::File => {
             let log_file = std::fs::File::create("logs/winston_conc.log").unwrap();
             builder
-                .transport(winston::transports::WriterTransport::new(log_file))
+                .transport(winston::transports::WriterTransport::new(BufWriter::new(log_file)))
                 .build()
         }
     };
