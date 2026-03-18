@@ -4,14 +4,14 @@ use env_logger::fmt::Formatter;
 use log::info;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
-use slog::{o, Drain, Logger};
+use slog::{o, Drain, Logger, KV};
 use slog_async;
 use slog_term;
 use std::collections::HashMap;
 use std::io::Write;
 use std::process::{exit, Command};
 use std::time::Instant;
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 use std::{env, fs, thread};
 use tracing::{event, Level};
 
@@ -234,20 +234,52 @@ fn bench_fern(target: OutputTarget) -> BenchmarkResult {
     })
 }
 
+// Serialize to a Vec<u8> first (no lock, no syscall), then write the whole
+// buffer in one locked write_all. This pushes the serde_json streaming
+// overhead outside the critical section and collapses N file-write syscalls
+// per record into one.
+struct PrebufDrain<W: Write + Send> {
+    writer: Mutex<W>,
+}
+
+impl<W: Write + Send> PrebufDrain<W> {
+    fn new(w: W) -> Self {
+        PrebufDrain { writer: Mutex::new(w) }
+    }
+}
+
+impl<W: Write + Send + 'static> slog::Drain for PrebufDrain<W> {
+    type Ok = ();
+    type Err = slog::Never;
+
+    fn log(&self, record: &slog::Record, values: &slog::OwnedKVList) -> Result<(), slog::Never> {
+        struct KvSer<'a>(&'a mut Vec<u8>);
+        impl slog::Serializer for KvSer<'_> {
+            fn emit_arguments(&mut self, key: slog::Key, val: &std::fmt::Arguments) -> slog::Result {
+                write!(self.0, ",\"{}\":\"{}\"", key, val).ok();
+                Ok(())
+            }
+        }
+
+        let mut buf = Vec::with_capacity(256);
+        write!(buf, "{{\"level\":\"{}\",\"msg\":\"{}\"", record.level().as_short_str(), record.msg()).ok();
+        let mut ser = KvSer(&mut buf);
+        record.kv().serialize(record, &mut ser).ok();
+        values.serialize(record, &mut ser).ok();
+        buf.extend_from_slice(b"}\n");
+
+        self.writer.lock().unwrap().write_all(&buf).ok();
+        Ok(())
+    }
+}
+
 fn bench_slog(target: OutputTarget) -> BenchmarkResult {
     let root = match target {
-        OutputTarget::Sink => {
-            let decorator = slog_term::PlainSyncDecorator::new(std::io::sink());
-            Logger::root(slog_term::FullFormat::new(decorator).build().fuse(), o!())
-        }
-        OutputTarget::Stdout => {
-            let decorator = slog_term::PlainSyncDecorator::new(std::io::stdout());
-            Logger::root(slog_term::FullFormat::new(decorator).build().fuse(), o!())
-        }
+        OutputTarget::Sink => Logger::root(PrebufDrain::new(std::io::sink()).fuse(), o!()),
+        OutputTarget::Stdout => Logger::root(PrebufDrain::new(std::io::stdout()).fuse(), o!()),
         OutputTarget::File => {
             let log_file = std::fs::File::create("logs/slog.log").unwrap();
-            let drain = std::sync::Mutex::new(slog_json::Json::default(log_file)).fuse();
-            Logger::root(drain, o!())
+            Logger::root(PrebufDrain::new(log_file).fuse(), o!())
         }
     };
 
@@ -517,18 +549,11 @@ fn bench_fern_concurrent(target: OutputTarget) -> (f64, u64) {
 
 fn bench_slog_concurrent(target: OutputTarget) -> (f64, u64) {
     let root = match target {
-        OutputTarget::Sink => {
-            let decorator = slog_term::PlainSyncDecorator::new(std::io::sink());
-            Logger::root(slog_term::FullFormat::new(decorator).build().fuse(), o!())
-        }
-        OutputTarget::Stdout => {
-            let decorator = slog_term::PlainSyncDecorator::new(std::io::stdout());
-            Logger::root(slog_term::FullFormat::new(decorator).build().fuse(), o!())
-        }
+        OutputTarget::Sink => Logger::root(PrebufDrain::new(std::io::sink()).fuse(), o!()),
+        OutputTarget::Stdout => Logger::root(PrebufDrain::new(std::io::stdout()).fuse(), o!()),
         OutputTarget::File => {
             let log_file = std::fs::File::create("logs/slog_conc.log").unwrap();
-            let drain = std::sync::Mutex::new(slog_json::Json::default(log_file)).fuse();
-            Logger::root(drain, o!())
+            Logger::root(PrebufDrain::new(log_file).fuse(), o!())
         }
     };
     run_concurrent(move || {
