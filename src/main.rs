@@ -35,6 +35,8 @@ const NUM_WARMUP_RUNS: usize = 1;
 const MESSAGE: &str = "A logging message that is reasonably long";
 const CONCURRENT_THREADS: usize = 4;
 const CONC_ITERS_PER_THREAD: usize = 25_000;
+// 10% of the total concurrent log volume — guarantees OverflowStrategy::Block fires repeatedly.
+const SATURATION_CHANNEL_SIZE: usize = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum OutputTarget {
@@ -651,6 +653,85 @@ fn bench_winston_concurrent(target: OutputTarget) -> (f64, u64) {
     })
 }
 
+fn bench_slog_async_saturate(target: OutputTarget) -> (f64, u64) {
+    macro_rules! async_drain {
+        ($w:expr) => {
+            slog_async::Async::new(PrebufDrain::new($w).fuse())
+                .chan_size(SATURATION_CHANNEL_SIZE)
+                .overflow_strategy(slog_async::OverflowStrategy::Block)
+                .build()
+                .fuse()
+        };
+    }
+
+    let drain = match target {
+        OutputTarget::Sink => async_drain!(std::io::sink()),
+        OutputTarget::Stdout => async_drain!(std::io::stdout()),
+        OutputTarget::File => {
+            let log_file = std::fs::File::create("logs/slog_async_sat.log").unwrap();
+            async_drain!(log_file)
+        }
+    };
+    let root = Logger::root(drain, o!());
+    run_concurrent(move || {
+        let root = root.clone();
+        move || slog::info!(root, "{} {}", MESSAGE, "slog_async")
+    })
+}
+
+fn bench_tracing_async_saturate(target: OutputTarget) -> (f64, u64) {
+    use tracing_appender::non_blocking::NonBlockingBuilder;
+    use tracing_subscriber::fmt;
+    let (writer, _guard) = match target {
+        OutputTarget::Sink => NonBlockingBuilder::default()
+            .buffered_lines_limit(SATURATION_CHANNEL_SIZE)
+            .lossy(false)
+            .finish(std::io::sink()),
+        OutputTarget::Stdout => NonBlockingBuilder::default()
+            .buffered_lines_limit(SATURATION_CHANNEL_SIZE)
+            .lossy(false)
+            .finish(std::io::stdout()),
+        OutputTarget::File => {
+            let file = std::fs::File::create("logs/tracing_async_sat.log").unwrap();
+            NonBlockingBuilder::default()
+                .buffered_lines_limit(SATURATION_CHANNEL_SIZE)
+                .lossy(false)
+                .finish(file)
+        }
+    };
+    let subscriber = fmt().json().with_writer(writer).finish();
+    tracing::subscriber::set_global_default(subscriber).expect("setting tracing default failed");
+    // _guard must outlive run_concurrent so the background thread stays alive until threads join
+    let result = run_concurrent(|| || event!(Level::INFO, "{} {}", MESSAGE, "tracing_async"));
+    drop(_guard);
+    result
+}
+
+fn bench_winston_saturate(target: OutputTarget) -> (f64, u64) {
+    let builder = winston::Logger::builder()
+        .channel_capacity(SATURATION_CHANNEL_SIZE)
+        .backpressure_strategy(winston::BackpressureStrategy::Block);
+    let logger = match target {
+        OutputTarget::Sink => builder
+            .transport(winston::transports::WriterTransport::new(std::io::sink()))
+            .build(),
+        OutputTarget::Stdout => builder
+            .transport(winston::transports::WriterTransport::new(BufWriter::new(std::io::stdout())))
+            .build(),
+        OutputTarget::File => {
+            let log_file = std::fs::File::create("logs/winston_sat.log").unwrap();
+            builder
+                .transport(winston::transports::WriterTransport::new(BufWriter::new(log_file)))
+                .build()
+        }
+    };
+    let logger = Arc::new(logger);
+    run_concurrent(move || {
+        let logger = Arc::clone(&logger);
+        move || winston::log!(*logger, info, format!("{} {}", MESSAGE, "winston"))
+    })
+}
+
 fn run_concurrent_benchmark(benchmark_name: &str, target_name: &str) {
     let target = match target_name {
         "sink" => OutputTarget::Sink,
@@ -670,6 +751,25 @@ fn run_concurrent_benchmark(benchmark_name: &str, target_name: &str) {
     };
     println!(
         "LOGMARK_CONC: {} {} {:.4} {}",
+        benchmark_name, target_name, ops, p99
+    );
+}
+
+fn run_saturation_benchmark(benchmark_name: &str, target_name: &str) {
+    let target = match target_name {
+        "sink" => OutputTarget::Sink,
+        "stdout" => OutputTarget::Stdout,
+        "file" => OutputTarget::File,
+        _ => panic!("Unknown target: {}", target_name),
+    };
+    let (ops, p99) = match benchmark_name {
+        "slog_async" => bench_slog_async_saturate(target),
+        "tracing_async" => bench_tracing_async_saturate(target),
+        "winston" => bench_winston_saturate(target),
+        _ => panic!("Saturation benchmark not supported for: {}", benchmark_name),
+    };
+    println!(
+        "LOGMARK_SAT: {} {} {:.4} {}",
         benchmark_name, target_name, ops, p99
     );
 }
@@ -713,9 +813,14 @@ fn run_benchmarks_in_processes(
     benchmarks: &[&str],
     targets: &[OutputTarget],
     runs: usize,
-) -> (HashMap<String, BenchmarkStats>, HashMap<String, ConcurrentStats>) {
+) -> (
+    HashMap<String, BenchmarkStats>,
+    HashMap<String, ConcurrentStats>,
+    HashMap<String, ConcurrentStats>,
+) {
     let mut results: HashMap<String, BenchmarkStats> = HashMap::new();
     let mut conc_results: HashMap<String, ConcurrentStats> = HashMap::new();
+    let mut sat_results: HashMap<String, ConcurrentStats> = HashMap::new();
     let mut rng = thread_rng();
 
     let _ = fs::create_dir_all("benchmark_results");
@@ -871,7 +976,72 @@ fn run_benchmarks_in_processes(
         }
     }
 
-    (results, conc_results)
+    // Saturation pass — async loggers only, intentionally undersized channel.
+    let async_benchmarks = ["slog_async", "tracing_async", "winston"];
+    let mut sat_pairs: Vec<(&str, OutputTarget)> = async_benchmarks
+        .iter()
+        .flat_map(|&bench| targets.iter().map(move |&target| (bench, target)))
+        .collect();
+
+    for run in 1..=runs {
+        println!(
+            "\n-- saturation run {} of {}  [{}] --",
+            run,
+            runs,
+            Local::now().format("%H:%M:%S")
+        );
+        sat_pairs.shuffle(&mut rng);
+
+        for &(bench, target) in &sat_pairs {
+            println!("  {} ({}) ×{} [sat]", bench, target.as_str(), CONCURRENT_THREADS);
+
+            let output = Command::new(env::current_exe().unwrap())
+                .arg("--saturate")
+                .arg(bench)
+                .arg(target.as_str())
+                .output()
+                .expect("Failed to run saturation benchmark");
+
+            if output.status.success() {
+                let output_str = String::from_utf8(output.stdout).unwrap();
+
+                if let Some(line) = output_str
+                    .lines()
+                    .find(|l| l.starts_with("LOGMARK_SAT: "))
+                {
+                    let parts: Vec<&str> =
+                        line["LOGMARK_SAT: ".len()..].split_whitespace().collect();
+                    if parts.len() >= 4 {
+                        let name = format!("{}_{}", parts[0], parts[1]);
+                        let ops: f64 = parts[2].parse().unwrap();
+                        let p99: u64 = parts[3].parse().unwrap();
+
+                        let stats = sat_results.entry(name).or_default();
+                        stats.ops_rates.push(ops);
+                        stats.p99_ns.push(p99);
+
+                        println!(
+                            "    [{}] done  {}  p99={}",
+                            Local::now().format("%H:%M:%S"),
+                            fmt_ops(ops),
+                            fmt_latency(p99),
+                        );
+                    }
+                }
+            } else {
+                eprintln!(
+                    "Saturation benchmark {} ({}) failed:\n{}",
+                    bench,
+                    target.as_str(),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+
+            thread::sleep(std::time::Duration::from_millis(500));
+        }
+    }
+
+    (results, conc_results, sat_results)
 }
 
 fn mean(values: &[f64]) -> f64 {
@@ -957,6 +1127,7 @@ fn cov(values: &[f64]) -> f64 {
 fn print_stats_report(
     stats: &HashMap<String, BenchmarkStats>,
     conc_stats: &HashMap<String, ConcurrentStats>,
+    sat_stats: &HashMap<String, ConcurrentStats>,
     run_timestamp: &str,
     logger_count: usize,
 ) {
@@ -1209,6 +1380,83 @@ fn print_stats_report(
         }
     }
 
+    // Saturation tables — one per target, async loggers only.
+    println!("\n{sep}");
+    println!(
+        "  saturation  (channel={SATURATION_CHANNEL_SIZE}, {} threads × {} iters = {} total)",
+        CONCURRENT_THREADS,
+        CONC_ITERS_PER_THREAD,
+        CONCURRENT_THREADS * CONC_ITERS_PER_THREAD,
+    );
+    println!("  tput Δ = (sat − conc) / conc  |  P99 spike = sat P99 / conc P99");
+    println!("{sep}");
+
+    for target in &["sink", "stdout", "file"] {
+        let mut group: Vec<(&str, f64, f64, u64, u64)> = conc_stats
+            .iter()
+            .filter_map(|(name, cs)| {
+                name.rsplit_once('_')
+                    .filter(|(_, t)| t == target)
+                    .and_then(|(logger, _)| {
+                        sat_stats.get(name).map(|ss| {
+                            (
+                                logger,
+                                median(&cs.ops_rates),
+                                median(&ss.ops_rates),
+                                median_u64(&cs.p99_ns),
+                                median_u64(&ss.p99_ns),
+                            )
+                        })
+                    })
+            })
+            .collect();
+
+        if group.is_empty() {
+            continue;
+        }
+
+        group.sort_by(|(_, _, a_sat, _, _), (_, _, b_sat, _, _)| {
+            b_sat.partial_cmp(a_sat).unwrap()
+        });
+
+        println!("\n  ── {} ", target.to_uppercase());
+        println!(
+            "  {:>2}  {:<16}  {:>12}  {:>12}  {:>8}  {:>9}  {:>9}  {:>9}",
+            "#", "logger", "sat ops/s", "conc ops/s", "tput Δ", "sat P99", "conc P99", "P99 spike"
+        );
+        println!(
+            "  {:>2}  {:<16}  {:>12}  {:>12}  {:>8}  {:>9}  {:>9}  {:>9}",
+            "",
+            "────────────────",
+            "────────────",
+            "────────────",
+            "────────",
+            "─────────",
+            "─────────",
+            "─────────",
+        );
+
+        for (rank, (logger, conc_ops, sat_ops, conc_p99, sat_p99)) in group.iter().enumerate() {
+            let tput_delta = (sat_ops - conc_ops) / conc_ops * 100.0;
+            let p99_spike = if *conc_p99 > 0 {
+                *sat_p99 as f64 / *conc_p99 as f64
+            } else {
+                0.0
+            };
+            println!(
+                "  {:>2}  {:<16}  {:>12}  {:>12}  {:>8}  {:>9}  {:>9}  {:>9}",
+                rank + 1,
+                logger,
+                fmt_ops(*sat_ops),
+                fmt_ops(*conc_ops),
+                format!("{:+.1}%", tput_delta),
+                fmt_latency(*sat_p99),
+                fmt_latency(*conc_p99),
+                format!("{:.1}×", p99_spike),
+            );
+        }
+    }
+
     println!("\nResults written to benchmark_results/");
 }
 
@@ -1220,6 +1468,10 @@ fn main() {
     }
     if args.len() > 3 && args[1] == "--concurrent" {
         run_concurrent_benchmark(&args[2], &args[3]);
+        exit(0);
+    }
+    if args.len() > 3 && args[1] == "--saturate" {
+        run_saturation_benchmark(&args[2], &args[3]);
         exit(0);
     }
 
@@ -1247,6 +1499,6 @@ fn main() {
         NUM_RUNS
     );
 
-    let (stats, conc_stats) = run_benchmarks_in_processes(&benchmarks, &targets, NUM_RUNS);
-    print_stats_report(&stats, &conc_stats, &run_timestamp, benchmarks.len());
+    let (stats, conc_stats, sat_stats) = run_benchmarks_in_processes(&benchmarks, &targets, NUM_RUNS);
+    print_stats_report(&stats, &conc_stats, &sat_stats, &run_timestamp, benchmarks.len());
 }
