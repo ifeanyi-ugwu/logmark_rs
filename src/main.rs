@@ -13,6 +13,7 @@ use std::time::Instant;
 use std::sync::{Arc, Barrier, Mutex};
 use std::{env, fs, thread};
 use tracing::{event, Level};
+use winston::format::Format as _;
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
@@ -177,7 +178,8 @@ fn bench_env_logger(target: OutputTarget) -> BenchmarkResult {
     builder.format(|buf: &mut Formatter, record| {
         writeln!(
             buf,
-            "{{\"level\":\"{}\",\"target\":\"{}\",\"message\":\"{}\"}}",
+            "{{\"timestamp\":\"{}\",\"level\":\"{}\",\"target\":\"{}\",\"message\":\"{}\"}}",
+            chrono::Utc::now().to_rfc3339(),
             record.level(),
             record.target(),
             record.args()
@@ -210,7 +212,8 @@ fn bench_fern(target: OutputTarget) -> BenchmarkResult {
     let dispatch = fern::Dispatch::new()
         .format(|out, message, record| {
             out.finish(format_args!(
-                r#"{{"level":"{}","target":"{}","message":"{}"}}"#,
+                r#"{{"timestamp":"{}","level":"{}","target":"{}","message":"{}"}}"#,
+                chrono::Utc::now().to_rfc3339(),
                 record.level(),
                 record.target(),
                 message
@@ -263,7 +266,14 @@ impl<W: Write + Send + 'static> slog::Drain for PrebufDrain<W> {
         }
 
         let mut buf = Vec::with_capacity(256);
-        write!(buf, "{{\"level\":\"{}\",\"msg\":\"{}\"", record.level().as_short_str(), record.msg()).ok();
+        write!(
+            buf,
+            "{{\"timestamp\":\"{}\",\"level\":\"{}\",\"target\":\"{}\",\"message\":\"{}\"",
+            chrono::Utc::now().to_rfc3339(),
+            record.level().as_str(),
+            record.location().module,
+            record.msg()
+        ).ok();
         let mut ser = KvSer(&mut buf);
         record.kv().serialize(record, &mut ser).ok();
         values.serialize(record, &mut ser).ok();
@@ -360,6 +370,7 @@ fn bench_tracing(target: OutputTarget) -> BenchmarkResult {
 
     let subscriber = tracing_subscriber::fmt()
         .json()
+        .flatten_event(true)
         .with_writer(writer)
         .finish();
 
@@ -394,7 +405,7 @@ fn bench_tracing_async(target: OutputTarget) -> BenchmarkResult {
         }
     };
 
-    let subscriber = fmt().json().with_writer(writer).finish();
+    let subscriber = fmt().json().flatten_event(true).with_writer(writer).finish();
     tracing::subscriber::set_global_default(subscriber).expect("setting tracing default failed");
 
     // Latency pass: enqueue latency (caller's view, no drain per call).
@@ -433,7 +444,15 @@ fn bench_tracing_async(target: OutputTarget) -> BenchmarkResult {
 fn bench_winston(target: OutputTarget) -> BenchmarkResult {
     let builder = winston::Logger::builder()
         .channel_capacity(50_000)
-        .backpressure_strategy(winston::BackpressureStrategy::Block);
+        .backpressure_strategy(winston::BackpressureStrategy::Block)
+        .format(winston::format::timestamp().chain(winston::format::printf(|info| {
+            format!(
+                r#"{{"timestamp":"{}","level":"{}","target":"logmark","message":"{}"}}"#,
+                info.meta.get("timestamp").and_then(|v| v.as_str()).unwrap_or(""),
+                info.level.to_ascii_uppercase(),
+                info.message
+            )
+        })));
 
     let logger = match target {
         OutputTarget::Sink => builder
@@ -489,7 +508,8 @@ fn bench_env_logger_concurrent(target: OutputTarget) -> (f64, u64) {
     builder.format(|buf: &mut Formatter, record| {
         writeln!(
             buf,
-            "{{\"level\":\"{}\",\"target\":\"{}\",\"message\":\"{}\"}}",
+            "{{\"timestamp\":\"{}\",\"level\":\"{}\",\"target\":\"{}\",\"message\":\"{}\"}}",
+            chrono::Utc::now().to_rfc3339(),
             record.level(),
             record.target(),
             record.args()
@@ -518,7 +538,8 @@ fn bench_fern_concurrent(target: OutputTarget) -> (f64, u64) {
     let dispatch = fern::Dispatch::new()
         .format(|out, message, record| {
             out.finish(format_args!(
-                r#"{{"level":"{}","target":"{}","message":"{}"}}"#,
+                r#"{{"timestamp":"{}","level":"{}","target":"{}","message":"{}"}}"#,
+                chrono::Utc::now().to_rfc3339(),
                 record.level(),
                 record.target(),
                 message
@@ -593,6 +614,7 @@ fn bench_tracing_concurrent(target: OutputTarget) -> (f64, u64) {
     };
     let subscriber = tracing_subscriber::fmt()
         .json()
+        .flatten_event(true)
         .with_writer(writer)
         .finish();
     tracing::subscriber::set_global_default(subscriber).expect("setting tracing default failed");
@@ -620,7 +642,7 @@ fn bench_tracing_async_concurrent(target: OutputTarget) -> (f64, u64) {
                 .finish(file)
         }
     };
-    let subscriber = fmt().json().with_writer(writer).finish();
+    let subscriber = fmt().json().flatten_event(true).with_writer(writer).finish();
     tracing::subscriber::set_global_default(subscriber).expect("setting tracing default failed");
     // _guard outlives run_concurrent — background thread stays alive until after threads join
     let result = run_concurrent(|| || event!(Level::INFO, "{} {}", MESSAGE, "tracing_async"));
@@ -631,7 +653,15 @@ fn bench_tracing_async_concurrent(target: OutputTarget) -> (f64, u64) {
 fn bench_winston_concurrent(target: OutputTarget) -> (f64, u64) {
     let builder = winston::Logger::builder()
         .channel_capacity(200_000)
-        .backpressure_strategy(winston::BackpressureStrategy::Block);
+        .backpressure_strategy(winston::BackpressureStrategy::Block)
+        .format(winston::format::timestamp().chain(winston::format::printf(|info| {
+            format!(
+                r#"{{"timestamp":"{}","level":"{}","target":"logmark","message":"{}"}}"#,
+                info.meta.get("timestamp").and_then(|v| v.as_str()).unwrap_or(""),
+                info.level.to_ascii_uppercase(),
+                info.message
+            )
+        })));
     let logger = match target {
         OutputTarget::Sink => builder
             .transport(winston::transports::WriterTransport::new(std::io::sink()))
@@ -699,7 +729,7 @@ fn bench_tracing_async_saturate(target: OutputTarget) -> (f64, u64) {
                 .finish(file)
         }
     };
-    let subscriber = fmt().json().with_writer(writer).finish();
+    let subscriber = fmt().json().flatten_event(true).with_writer(writer).finish();
     tracing::subscriber::set_global_default(subscriber).expect("setting tracing default failed");
     // _guard must outlive run_concurrent so the background thread stays alive until threads join
     let result = run_concurrent(|| || event!(Level::INFO, "{} {}", MESSAGE, "tracing_async"));
@@ -710,7 +740,15 @@ fn bench_tracing_async_saturate(target: OutputTarget) -> (f64, u64) {
 fn bench_winston_saturate(target: OutputTarget) -> (f64, u64) {
     let builder = winston::Logger::builder()
         .channel_capacity(SATURATION_CHANNEL_SIZE)
-        .backpressure_strategy(winston::BackpressureStrategy::Block);
+        .backpressure_strategy(winston::BackpressureStrategy::Block)
+        .format(winston::format::timestamp().chain(winston::format::printf(|info| {
+            format!(
+                r#"{{"timestamp":"{}","level":"{}","target":"logmark","message":"{}"}}"#,
+                info.meta.get("timestamp").and_then(|v| v.as_str()).unwrap_or(""),
+                info.level.to_ascii_uppercase(),
+                info.message
+            )
+        })));
     let logger = match target {
         OutputTarget::Sink => builder
             .transport(winston::transports::WriterTransport::new(std::io::sink()))
