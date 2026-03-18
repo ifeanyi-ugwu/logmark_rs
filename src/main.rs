@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::process::{exit, Command};
 use std::time::Instant;
+use std::sync::{Arc, Barrier};
 use std::{env, fs, thread};
 use tracing::{event, Level};
 
@@ -33,6 +34,8 @@ const LATENCY_ITERATIONS: usize = 10_000;
 const NUM_RUNS: usize = 3;
 const NUM_WARMUP_RUNS: usize = 1;
 const MESSAGE: &str = "A logging message that is reasonably long";
+const CONCURRENT_THREADS: usize = 4;
+const CONC_ITERS_PER_THREAD: usize = 25_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum OutputTarget {
@@ -65,6 +68,12 @@ struct BenchmarkResult {
     p99_ns: u64,
     p999_ns: u64,
     max_ns: u64,
+}
+
+#[derive(Default)]
+struct ConcurrentStats {
+    ops_rates: Vec<f64>,
+    p99_ns: Vec<u64>,
 }
 
 #[derive(Default)]
@@ -120,6 +129,44 @@ fn run_benchmark<F: Fn()>(name: &str, target: OutputTarget, bench_fn: F) -> Benc
         p999_ns: p999,
         max_ns: max,
     }
+}
+
+// Runs bench_fn across CONCURRENT_THREADS threads, all starting at the same
+// barrier. Returns (total_ops_per_sec, worst_thread_P99_ns).
+fn run_concurrent<S, F>(setup: S) -> (f64, u64)
+where
+    S: Fn() -> F + Send + Sync + 'static,
+    F: Fn() + Send + 'static,
+{
+    let setup = Arc::new(setup);
+    let barrier = Arc::new(Barrier::new(CONCURRENT_THREADS));
+
+    let handles: Vec<_> = (0..CONCURRENT_THREADS)
+        .map(|_| {
+            let setup = Arc::clone(&setup);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let bench_fn = setup();
+                barrier.wait();
+                let mut samples = vec![0u64; CONC_ITERS_PER_THREAD];
+                let start = Instant::now();
+                for slot in samples.iter_mut() {
+                    let t = Instant::now();
+                    bench_fn();
+                    *slot = t.elapsed().as_nanos() as u64;
+                }
+                let elapsed = start.elapsed().as_secs_f64();
+                samples.sort_unstable();
+                (elapsed, samples[CONC_ITERS_PER_THREAD * 99 / 100])
+            })
+        })
+        .collect();
+
+    let results: Vec<(f64, u64)> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let wall = results.iter().map(|(e, _)| *e).fold(0.0f64, f64::max);
+    let total = (CONCURRENT_THREADS * CONC_ITERS_PER_THREAD) as f64;
+    let p99 = results.iter().map(|(_, p)| *p).max().unwrap_or(0);
+    (total / wall, p99)
 }
 
 fn bench_env_logger(target: OutputTarget) -> BenchmarkResult {
@@ -412,6 +459,215 @@ fn bench_winston(target: OutputTarget) -> BenchmarkResult {
     }
 }
 
+fn bench_env_logger_concurrent(target: OutputTarget) -> (f64, u64) {
+    env::set_var("RUST_LOG", "info");
+    let mut builder = env_logger::Builder::from_default_env();
+    builder.format(|buf: &mut Formatter, record| {
+        writeln!(
+            buf,
+            "{{\"level\":\"{}\",\"target\":\"{}\",\"message\":\"{}\"}}",
+            record.level(),
+            record.target(),
+            record.args()
+        )
+    });
+    match target {
+        OutputTarget::Sink => {
+            builder
+                .target(env_logger::Target::Pipe(Box::new(std::io::sink())))
+                .init();
+        }
+        OutputTarget::Stdout => {
+            builder.target(env_logger::Target::Stdout).init();
+        }
+        OutputTarget::File => {
+            let f = std::fs::File::create("logs/env_logger_conc.log").unwrap();
+            builder
+                .target(env_logger::Target::Pipe(Box::new(f)))
+                .init();
+        }
+    }
+    run_concurrent(|| || log::info!("{} {}", MESSAGE, "env_logger"))
+}
+
+fn bench_fern_concurrent(target: OutputTarget) -> (f64, u64) {
+    let dispatch = fern::Dispatch::new()
+        .format(|out, message, record| {
+            out.finish(format_args!(
+                r#"{{"level":"{}","target":"{}","message":"{}"}}"#,
+                record.level(),
+                record.target(),
+                message
+            ))
+        })
+        .level(log::LevelFilter::Info);
+    match target {
+        OutputTarget::Sink => dispatch
+            .chain(Box::new(std::io::sink()) as Box<dyn std::io::Write + Send>)
+            .apply()
+            .unwrap(),
+        OutputTarget::Stdout => dispatch.chain(std::io::stdout()).apply().unwrap(),
+        OutputTarget::File => {
+            let f = std::fs::File::create("logs/fern_conc.log").unwrap();
+            dispatch.chain(f).apply().unwrap()
+        }
+    }
+    run_concurrent(|| || log::info!("{} {}", MESSAGE, "fern"))
+}
+
+fn bench_slog_concurrent(target: OutputTarget) -> (f64, u64) {
+    let root = match target {
+        OutputTarget::Sink => {
+            let decorator = slog_term::PlainSyncDecorator::new(std::io::sink());
+            Logger::root(slog_term::FullFormat::new(decorator).build().fuse(), o!())
+        }
+        OutputTarget::Stdout => {
+            let decorator = slog_term::PlainSyncDecorator::new(std::io::stdout());
+            Logger::root(slog_term::FullFormat::new(decorator).build().fuse(), o!())
+        }
+        OutputTarget::File => {
+            let log_file = std::fs::File::create("logs/slog_conc.log").unwrap();
+            let drain = std::sync::Mutex::new(slog_json::Json::default(log_file)).fuse();
+            Logger::root(drain, o!())
+        }
+    };
+    run_concurrent(move || {
+        let root = root.clone();
+        move || slog::info!(root, "{} {}", MESSAGE, "slog")
+    })
+}
+
+fn bench_slog_async_concurrent(target: OutputTarget) -> (f64, u64) {
+    const CHANNEL_SIZE: usize = 200_000;
+    let drain = match target {
+        OutputTarget::Sink => {
+            let decorator = slog_term::PlainSyncDecorator::new(std::io::sink());
+            let drain = slog_term::FullFormat::new(decorator).build().fuse();
+            slog_async::Async::new(drain)
+                .chan_size(CHANNEL_SIZE)
+                .overflow_strategy(slog_async::OverflowStrategy::Block)
+                .build()
+                .fuse()
+        }
+        OutputTarget::Stdout => {
+            let decorator = slog_term::PlainSyncDecorator::new(std::io::stdout());
+            let drain = slog_term::FullFormat::new(decorator).build().fuse();
+            slog_async::Async::new(drain)
+                .chan_size(CHANNEL_SIZE)
+                .overflow_strategy(slog_async::OverflowStrategy::Block)
+                .build()
+                .fuse()
+        }
+        OutputTarget::File => {
+            let log_file = std::fs::File::create("logs/slog_async_conc.log").unwrap();
+            let drain = slog_json::Json::default(log_file).fuse();
+            slog_async::Async::new(drain)
+                .chan_size(CHANNEL_SIZE)
+                .overflow_strategy(slog_async::OverflowStrategy::Block)
+                .build()
+                .fuse()
+        }
+    };
+    let root = Logger::root(drain, o!());
+    run_concurrent(move || {
+        let root = root.clone();
+        move || slog::info!(root, "{} {}", MESSAGE, "slog_async")
+    })
+}
+
+fn bench_tracing_concurrent(target: OutputTarget) -> (f64, u64) {
+    use tracing_subscriber::fmt::writer::BoxMakeWriter;
+    let writer = match target {
+        OutputTarget::Sink => BoxMakeWriter::new(std::io::sink),
+        OutputTarget::Stdout => BoxMakeWriter::new(std::io::stdout),
+        OutputTarget::File => {
+            let file = std::fs::File::create("logs/tracing_conc.log").unwrap();
+            BoxMakeWriter::new(move || file.try_clone().unwrap())
+        }
+    };
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_writer(writer)
+        .finish();
+    tracing::subscriber::set_global_default(subscriber).expect("setting tracing default failed");
+    run_concurrent(|| || event!(Level::INFO, "{} {}", MESSAGE, "tracing"))
+}
+
+fn bench_tracing_async_concurrent(target: OutputTarget) -> (f64, u64) {
+    use tracing_appender::non_blocking::NonBlockingBuilder;
+    use tracing_subscriber::fmt;
+    const CHANNEL_SIZE: usize = 200_000;
+    let (writer, _guard) = match target {
+        OutputTarget::Sink => NonBlockingBuilder::default()
+            .buffered_lines_limit(CHANNEL_SIZE)
+            .lossy(false)
+            .finish(std::io::sink()),
+        OutputTarget::Stdout => NonBlockingBuilder::default()
+            .buffered_lines_limit(CHANNEL_SIZE)
+            .lossy(false)
+            .finish(std::io::stdout()),
+        OutputTarget::File => {
+            let file = std::fs::File::create("logs/tracing_async_conc.log").unwrap();
+            NonBlockingBuilder::default()
+                .buffered_lines_limit(CHANNEL_SIZE)
+                .lossy(false)
+                .finish(file)
+        }
+    };
+    let subscriber = fmt().json().with_writer(writer).finish();
+    tracing::subscriber::set_global_default(subscriber).expect("setting tracing default failed");
+    // _guard outlives run_concurrent — background thread stays alive until after threads join
+    let result = run_concurrent(|| || event!(Level::INFO, "{} {}", MESSAGE, "tracing_async"));
+    drop(_guard);
+    result
+}
+
+fn bench_winston_concurrent(target: OutputTarget) -> (f64, u64) {
+    let builder = winston::Logger::builder()
+        .channel_capacity(200_000)
+        .backpressure_strategy(winston::BackpressureStrategy::Block);
+    let logger = match target {
+        OutputTarget::Sink => builder
+            .transport(winston::transports::WriterTransport::new(std::io::sink()))
+            .build(),
+        OutputTarget::Stdout => builder.transport(winston::transports::stdout()).build(),
+        OutputTarget::File => {
+            let log_file = std::fs::File::create("logs/winston_conc.log").unwrap();
+            builder
+                .transport(winston::transports::WriterTransport::new(log_file))
+                .build()
+        }
+    };
+    let logger = Arc::new(logger);
+    run_concurrent(move || {
+        let logger = Arc::clone(&logger);
+        move || winston::log!(*logger, info, format!("{} {}", MESSAGE, "winston"))
+    })
+}
+
+fn run_concurrent_benchmark(benchmark_name: &str, target_name: &str) {
+    let target = match target_name {
+        "sink" => OutputTarget::Sink,
+        "stdout" => OutputTarget::Stdout,
+        "file" => OutputTarget::File,
+        _ => panic!("Unknown target: {}", target_name),
+    };
+    let (ops, p99) = match benchmark_name {
+        "env_logger" => bench_env_logger_concurrent(target),
+        "fern" => bench_fern_concurrent(target),
+        "slog" => bench_slog_concurrent(target),
+        "slog_async" => bench_slog_async_concurrent(target),
+        "tracing" => bench_tracing_concurrent(target),
+        "tracing_async" => bench_tracing_async_concurrent(target),
+        "winston" => bench_winston_concurrent(target),
+        _ => panic!("Unknown benchmark: {}", benchmark_name),
+    };
+    println!(
+        "LOGMARK_CONC: {} {} {:.4} {}",
+        benchmark_name, target_name, ops, p99
+    );
+}
+
 fn run_individual_benchmark(benchmark_name: &str, target_name: &str) -> BenchmarkResult {
     let target = match target_name {
         "sink" => OutputTarget::Sink,
@@ -451,8 +707,9 @@ fn run_benchmarks_in_processes(
     benchmarks: &[&str],
     targets: &[OutputTarget],
     runs: usize,
-) -> HashMap<String, BenchmarkStats> {
+) -> (HashMap<String, BenchmarkStats>, HashMap<String, ConcurrentStats>) {
     let mut results: HashMap<String, BenchmarkStats> = HashMap::new();
+    let mut conc_results: HashMap<String, ConcurrentStats> = HashMap::new();
     let mut rng = thread_rng();
 
     let _ = fs::create_dir_all("benchmark_results");
@@ -549,7 +806,66 @@ fn run_benchmarks_in_processes(
         }
     }
 
-    results
+    // Concurrent pass — no warmup, same NUM_RUNS.
+    for run in 1..=runs {
+        println!(
+            "\n-- concurrent run {} of {}  [{}] --",
+            run,
+            runs,
+            Local::now().format("%H:%M:%S")
+        );
+        all_benchmarks.shuffle(&mut rng);
+
+        for &(bench, target) in &all_benchmarks {
+            println!("  {} ({}) ×{}", bench, target.as_str(), CONCURRENT_THREADS);
+
+            let output = Command::new(env::current_exe().unwrap())
+                .arg("--concurrent")
+                .arg(bench)
+                .arg(target.as_str())
+                .output()
+                .expect("Failed to run concurrent benchmark");
+
+            if output.status.success() {
+                let output_str = String::from_utf8(output.stdout).unwrap();
+
+                if let Some(line) = output_str
+                    .lines()
+                    .find(|l| l.starts_with("LOGMARK_CONC: "))
+                {
+                    let parts: Vec<&str> =
+                        line["LOGMARK_CONC: ".len()..].split_whitespace().collect();
+                    if parts.len() >= 4 {
+                        let name = format!("{}_{}", parts[0], parts[1]);
+                        let ops: f64 = parts[2].parse().unwrap();
+                        let p99: u64 = parts[3].parse().unwrap();
+
+                        let stats = conc_results.entry(name).or_default();
+                        stats.ops_rates.push(ops);
+                        stats.p99_ns.push(p99);
+
+                        println!(
+                            "    [{}] done  {}  p99={}",
+                            Local::now().format("%H:%M:%S"),
+                            fmt_ops(ops),
+                            fmt_latency(p99),
+                        );
+                    }
+                }
+            } else {
+                eprintln!(
+                    "Concurrent benchmark {} ({}) failed:\n{}",
+                    bench,
+                    target.as_str(),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+
+            thread::sleep(std::time::Duration::from_millis(500));
+        }
+    }
+
+    (results, conc_results)
 }
 
 fn mean(values: &[f64]) -> f64 {
@@ -634,6 +950,7 @@ fn cov(values: &[f64]) -> f64 {
 
 fn print_stats_report(
     stats: &HashMap<String, BenchmarkStats>,
+    conc_stats: &HashMap<String, ConcurrentStats>,
     run_timestamp: &str,
     logger_count: usize,
 ) {
@@ -819,6 +1136,73 @@ fn print_stats_report(
         }
     }
 
+    // Concurrent throughput tables — one per target.
+    println!("\n{sep}");
+    println!(
+        "  concurrency  ({} threads × {} iters/thread)",
+        CONCURRENT_THREADS, CONC_ITERS_PER_THREAD
+    );
+    println!("  scale = conc ops/s ÷ seq ops/s  (ideal ≈ {CONCURRENT_THREADS}×)");
+    println!("{sep}");
+
+    for target in &["sink", "stdout", "file"] {
+        let mut group: Vec<(&str, f64, f64, u64)> = stats
+            .iter()
+            .filter_map(|(name, seq_stat)| {
+                name.rsplit_once('_')
+                    .filter(|(_, t)| t == target)
+                    .and_then(|(logger, _)| {
+                        let conc_key = name.as_str();
+                        conc_stats.get(conc_key).map(|cs| {
+                            (
+                                logger,
+                                median(&seq_stat.ops_rates),
+                                median(&cs.ops_rates),
+                                median_u64(&cs.p99_ns),
+                            )
+                        })
+                    })
+            })
+            .collect();
+
+        if group.is_empty() {
+            continue;
+        }
+
+        // Sort by concurrent ops/s descending.
+        group.sort_by(|(_, _, a_ops, _), (_, _, b_ops, _)| {
+            b_ops.partial_cmp(a_ops).unwrap()
+        });
+
+        println!("\n  ── {} ", target.to_uppercase());
+        println!(
+            "  {:>2}  {:<16}  {:>12}  {:>12}  {:>7}  {:>9}",
+            "#", "logger", "conc ops/s", "seq ops/s", "scale", "conc P99"
+        );
+        println!(
+            "  {:>2}  {:<16}  {:>12}  {:>12}  {:>7}  {:>9}",
+            "",
+            "────────────────",
+            "────────────",
+            "────────────",
+            "───────",
+            "─────────"
+        );
+
+        for (rank, (logger, seq_ops, conc_ops, p99)) in group.iter().enumerate() {
+            let scale = conc_ops / seq_ops;
+            println!(
+                "  {:>2}  {:<16}  {:>12}  {:>12}  {:>7}  {:>9}",
+                rank + 1,
+                logger,
+                fmt_ops(*conc_ops),
+                fmt_ops(*seq_ops),
+                format!("{:.1}×", scale),
+                fmt_latency(*p99),
+            );
+        }
+    }
+
     println!("\nResults written to benchmark_results/");
 }
 
@@ -826,6 +1210,10 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() > 3 && args[1] == "--benchmark" {
         let _ = run_individual_benchmark(&args[2], &args[3]);
+        exit(0);
+    }
+    if args.len() > 3 && args[1] == "--concurrent" {
+        run_concurrent_benchmark(&args[2], &args[3]);
         exit(0);
     }
 
@@ -853,6 +1241,6 @@ fn main() {
         NUM_RUNS
     );
 
-    let stats = run_benchmarks_in_processes(&benchmarks, &targets, NUM_RUNS);
-    print_stats_report(&stats, &run_timestamp, benchmarks.len());
+    let (stats, conc_stats) = run_benchmarks_in_processes(&benchmarks, &targets, NUM_RUNS);
+    print_stats_report(&stats, &conc_stats, &run_timestamp, benchmarks.len());
 }
