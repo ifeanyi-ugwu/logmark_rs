@@ -437,7 +437,9 @@ fn bench_winston(target: OutputTarget) -> BenchmarkResult {
         OutputTarget::Sink => builder
             .transport(winston::transports::WriterTransport::new(std::io::sink()))
             .build(),
-        OutputTarget::Stdout => builder.transport(winston::transports::stdout()).build(),
+        OutputTarget::Stdout => builder
+            .transport(winston::transports::WriterTransport::new(BufWriter::new(std::io::stdout())))
+            .build(),
         OutputTarget::File => {
             let log_file = std::fs::File::create("logs/winston.log").unwrap();
             builder
@@ -632,7 +634,9 @@ fn bench_winston_concurrent(target: OutputTarget) -> (f64, u64) {
         OutputTarget::Sink => builder
             .transport(winston::transports::WriterTransport::new(std::io::sink()))
             .build(),
-        OutputTarget::Stdout => builder.transport(winston::transports::stdout()).build(),
+        OutputTarget::Stdout => builder
+            .transport(winston::transports::WriterTransport::new(BufWriter::new(std::io::stdout())))
+            .build(),
         OutputTarget::File => {
             let log_file = std::fs::File::create("logs/winston_conc.log").unwrap();
             builder
