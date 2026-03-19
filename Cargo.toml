@@ -9,6 +9,7 @@ env_logger = "0.11.5"
 fern = "0.6.2"
 log = "0.4.22"
 rand = "0.8.5"
+tabled = "0.20"
 tikv-jemalloc-ctl = { version = "0.6.0", features = ["stats"] }
 slog = "2.7.0"
 slog-async = "2.8.0"

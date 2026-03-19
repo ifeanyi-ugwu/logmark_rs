@@ -12,6 +12,7 @@ use std::process::{exit, Command};
 use std::time::Instant;
 use std::sync::{Arc, Barrier, Mutex};
 use std::{env, fs, thread};
+use tabled::{builder::Builder, settings::Style};
 use tracing::{event, Level};
 use winston::format::Format as _;
 
@@ -1191,6 +1192,17 @@ fn fmt_mem(mb: f64) -> String {
     }
 }
 
+fn make_table(headers: &[&str], rows: &[Vec<String>]) -> String {
+    let mut builder = Builder::default();
+    builder.push_record(headers.iter().copied());
+    for row in rows {
+        builder.push_record(row.iter().map(String::as_str));
+    }
+    let mut table = builder.build();
+    table.with(Style::modern());
+    table.to_string()
+}
+
 // Coefficient of variation: stddev / mean. Used to flag unreliable runs.
 fn cov(values: &[f64]) -> f64 {
     let m = mean(values);
@@ -1213,7 +1225,7 @@ fn print_stats_report(
     println!("  {logger_count} loggers × 3 targets × {NUM_RUNS} runs × {ITERATIONS} iterations");
     println!("{sep}");
 
-    // Write detailed per-run file (all entries, sorted alphabetically).
+    // Detailed per-run file (plain text, all entries sorted alphabetically).
     let mut detail = fs::File::create("benchmark_results/detailed_stats.txt").unwrap();
     writeln!(detail, "logmark  {run_timestamp}").unwrap();
     writeln!(
@@ -1249,7 +1261,7 @@ fn print_stats_report(
         .unwrap();
     }
 
-    // Console tables and per-target summary files, grouped by target.
+    // Throughput tables — one per target, fastest first.
     for target in &["sink", "stdout", "file"] {
         let mut group: Vec<(&str, &BenchmarkStats)> = stats
             .iter()
@@ -1264,7 +1276,6 @@ fn print_stats_report(
             continue;
         }
 
-        // Fastest first.
         group.sort_by(|(_, a), (_, b)| {
             median(&b.ops_rates)
                 .partial_cmp(&median(&a.ops_rates))
@@ -1272,99 +1283,51 @@ fn print_stats_report(
         });
 
         let best_ops = median(&group[0].1.ops_rates);
-
-        println!("\n  ── {} ", target.to_uppercase());
-        println!(
-            "  {:>2}  {:<16}  {:>12}  {:>11}  {:>7}  {:<3}  {:>8}  {:>8}",
-            "#", "logger", "median ops/s", "median time", "vs best", "var", "init", "drain"
-        );
-        println!(
-            "  {:>2}  {:<16}  {:>12}  {:>11}  {:>7}  {:<3}  {:>8}  {:>8}",
-            "", "────────────────", "────────────", "───────────", "───────", "───", "────────", "────────"
-        );
-
         let mut any_flagged = false;
+        let mut rows: Vec<Vec<String>> = Vec::new();
+
         for (rank, (logger, stat)) in group.iter().enumerate() {
             let med_ops = median(&stat.ops_rates);
             let med_time = median(&stat.elapsed_times);
             let vs = best_ops / med_ops;
             let c = cov(&stat.elapsed_times);
-            let flag = if c > 0.25 { " [!]" } else { "" };
-            if c > 0.25 {
+            let flag = if c > 0.25 {
                 any_flagged = true;
-            }
-            let init_str = format!("{:.4}s", median(&stat.startup_times));
+                " [!]"
+            } else {
+                ""
+            };
             let drain_str = if stat.drain_times.iter().all(|&d| d == 0.0) {
                 "-".to_string()
             } else {
                 format!("{:.4}s", median(&stat.drain_times))
             };
-            println!(
-                "  {:>2}  {:<16}  {:>12}  {:>11}  {:>7}  ±{:.0}%{}  {:>8}  {:>8}",
-                rank + 1,
-                logger,
+            rows.push(vec![
+                format!("{}", rank + 1),
+                logger.to_string(),
                 fmt_ops(med_ops),
                 format!("{:.4}s", med_time),
                 format!("{:.1}×", vs),
-                c * 100.0,
-                flag,
-                init_str,
+                format!("±{:.0}%{}", c * 100.0, flag),
+                format!("{:.4}s", median(&stat.startup_times)),
                 drain_str,
-            );
+            ]);
         }
 
+        let headers = ["#", "logger", "median ops/s", "median time", "vs best", "var", "init", "drain"];
+        let table_str = make_table(&headers, &rows);
+
+        println!("\n  ── {} ", target.to_uppercase());
+        println!("{}", table_str);
         if any_flagged {
-            println!("      [!] CoV > 25% — high variance; median is more reliable than mean");
+            println!("  [!] CoV > 25% — high variance; median is more reliable than mean");
         }
 
-        // Per-target summary file mirrors the console table.
         let path = format!("benchmark_results/{target}_summary.txt");
         let mut f = fs::File::create(&path).unwrap();
         writeln!(f, "logmark  {target} target  {run_timestamp}").unwrap();
-        writeln!(
-            f,
-            "{logger_count} loggers × {NUM_RUNS} runs × {ITERATIONS} iterations\n"
-        )
-        .unwrap();
-        writeln!(
-            f,
-            "  {:>2}  {:<16}  {:>12}  {:>11}  {:>7}  {:<3}  {:>8}  {:>8}",
-            "#", "logger", "median ops/s", "median time", "vs best", "var", "init", "drain"
-        )
-        .unwrap();
-        writeln!(
-            f,
-            "  {:>2}  {:<16}  {:>12}  {:>11}  {:>7}  {:<3}  {:>8}  {:>8}",
-            "", "────────────────", "────────────", "───────────", "───────", "───", "────────", "────────"
-        )
-        .unwrap();
-        for (rank, (logger, stat)) in group.iter().enumerate() {
-            let med_ops = median(&stat.ops_rates);
-            let med_time = median(&stat.elapsed_times);
-            let vs = best_ops / med_ops;
-            let c = cov(&stat.elapsed_times);
-            let flag = if c > 0.25 { " [!]" } else { "" };
-            let init_str = format!("{:.4}s", median(&stat.startup_times));
-            let drain_str = if stat.drain_times.iter().all(|&d| d == 0.0) {
-                "-".to_string()
-            } else {
-                format!("{:.4}s", median(&stat.drain_times))
-            };
-            writeln!(
-                f,
-                "  {:>2}  {:<16}  {:>12}  {:>11}  {:>7}  ±{:.0}%{}  {:>8}  {:>8}",
-                rank + 1,
-                logger,
-                fmt_ops(med_ops),
-                format!("{:.4}s", med_time),
-                format!("{:.1}×", vs),
-                c * 100.0,
-                flag,
-                init_str,
-                drain_str,
-            )
-            .unwrap();
-        }
+        writeln!(f, "{logger_count} loggers × {NUM_RUNS} runs × {ITERATIONS} iterations\n").unwrap();
+        writeln!(f, "{}", table_str).unwrap();
     }
 
     // Latency tables — one per target, sorted by P99 ascending.
@@ -1389,27 +1352,24 @@ fn print_stats_report(
 
         group.sort_by_key(|(_, s)| median_u64(&s.p99_ns));
 
-        println!("\n  ── {} ", target.to_uppercase());
-        println!(
-            "  {:>2}  {:<16}  {:>9}  {:>9}  {:>9}  {:>9}",
-            "#", "logger", "P50", "P99", "P99.9", "max"
-        );
-        println!(
-            "  {:>2}  {:<16}  {:>9}  {:>9}  {:>9}  {:>9}",
-            "", "────────────────", "─────────", "─────────", "─────────", "─────────"
-        );
+        let headers = ["#", "logger", "P50", "P99", "P99.9", "max"];
+        let rows: Vec<Vec<String>> = group
+            .iter()
+            .enumerate()
+            .map(|(rank, (logger, stat))| {
+                vec![
+                    format!("{}", rank + 1),
+                    logger.to_string(),
+                    fmt_latency(median_u64(&stat.p50_ns)),
+                    fmt_latency(median_u64(&stat.p99_ns)),
+                    fmt_latency(median_u64(&stat.p999_ns)),
+                    fmt_latency(median_u64(&stat.max_ns)),
+                ]
+            })
+            .collect();
 
-        for (rank, (logger, stat)) in group.iter().enumerate() {
-            println!(
-                "  {:>2}  {:<16}  {:>9}  {:>9}  {:>9}  {:>9}",
-                rank + 1,
-                logger,
-                fmt_latency(median_u64(&stat.p50_ns)),
-                fmt_latency(median_u64(&stat.p99_ns)),
-                fmt_latency(median_u64(&stat.p999_ns)),
-                fmt_latency(median_u64(&stat.max_ns)),
-            );
-        }
+        println!("\n  ── {} ", target.to_uppercase());
+        println!("{}", make_table(&headers, &rows));
     }
 
     // Concurrent throughput tables — one per target.
@@ -1428,8 +1388,7 @@ fn print_stats_report(
                 name.rsplit_once('_')
                     .filter(|(_, t)| t == target)
                     .and_then(|(logger, _)| {
-                        let conc_key = name.as_str();
-                        conc_stats.get(conc_key).map(|cs| {
+                        conc_stats.get(name.as_str()).map(|cs| {
                             (
                                 logger,
                                 median(&seq_stat.ops_rates),
@@ -1445,38 +1404,26 @@ fn print_stats_report(
             continue;
         }
 
-        // Sort by concurrent ops/s descending.
-        group.sort_by(|(_, _, a_ops, _), (_, _, b_ops, _)| {
-            b_ops.partial_cmp(a_ops).unwrap()
-        });
+        group.sort_by(|(_, _, a_ops, _), (_, _, b_ops, _)| b_ops.partial_cmp(a_ops).unwrap());
+
+        let headers = ["#", "logger", "conc ops/s", "seq ops/s", "scale", "conc P99"];
+        let rows: Vec<Vec<String>> = group
+            .iter()
+            .enumerate()
+            .map(|(rank, (logger, seq_ops, conc_ops, p99))| {
+                vec![
+                    format!("{}", rank + 1),
+                    logger.to_string(),
+                    fmt_ops(*conc_ops),
+                    fmt_ops(*seq_ops),
+                    format!("{:.1}×", conc_ops / seq_ops),
+                    fmt_latency(*p99),
+                ]
+            })
+            .collect();
 
         println!("\n  ── {} ", target.to_uppercase());
-        println!(
-            "  {:>2}  {:<16}  {:>12}  {:>12}  {:>7}  {:>9}",
-            "#", "logger", "conc ops/s", "seq ops/s", "scale", "conc P99"
-        );
-        println!(
-            "  {:>2}  {:<16}  {:>12}  {:>12}  {:>7}  {:>9}",
-            "",
-            "────────────────",
-            "────────────",
-            "────────────",
-            "───────",
-            "─────────"
-        );
-
-        for (rank, (logger, seq_ops, conc_ops, p99)) in group.iter().enumerate() {
-            let scale = conc_ops / seq_ops;
-            println!(
-                "  {:>2}  {:<16}  {:>12}  {:>12}  {:>7}  {:>9}",
-                rank + 1,
-                logger,
-                fmt_ops(*conc_ops),
-                fmt_ops(*seq_ops),
-                format!("{:.1}×", scale),
-                fmt_latency(*p99),
-            );
-        }
+        println!("{}", make_table(&headers, &rows));
     }
 
     // Saturation tables — one per target, async loggers only.
@@ -1514,46 +1461,34 @@ fn print_stats_report(
             continue;
         }
 
-        group.sort_by(|(_, _, a_sat, _, _), (_, _, b_sat, _, _)| {
-            b_sat.partial_cmp(a_sat).unwrap()
-        });
+        group.sort_by(|(_, _, a_sat, _, _), (_, _, b_sat, _, _)| b_sat.partial_cmp(a_sat).unwrap());
+
+        let headers = ["#", "logger", "sat ops/s", "conc ops/s", "tput Δ", "sat P99", "conc P99", "P99 spike"];
+        let rows: Vec<Vec<String>> = group
+            .iter()
+            .enumerate()
+            .map(|(rank, (logger, conc_ops, sat_ops, conc_p99, sat_p99))| {
+                let tput_delta = (sat_ops - conc_ops) / conc_ops * 100.0;
+                let p99_spike = if *conc_p99 > 0 {
+                    *sat_p99 as f64 / *conc_p99 as f64
+                } else {
+                    0.0
+                };
+                vec![
+                    format!("{}", rank + 1),
+                    logger.to_string(),
+                    fmt_ops(*sat_ops),
+                    fmt_ops(*conc_ops),
+                    format!("{:+.1}%", tput_delta),
+                    fmt_latency(*sat_p99),
+                    fmt_latency(*conc_p99),
+                    format!("{:.1}×", p99_spike),
+                ]
+            })
+            .collect();
 
         println!("\n  ── {} ", target.to_uppercase());
-        println!(
-            "  {:>2}  {:<16}  {:>12}  {:>12}  {:>8}  {:>9}  {:>9}  {:>9}",
-            "#", "logger", "sat ops/s", "conc ops/s", "tput Δ", "sat P99", "conc P99", "P99 spike"
-        );
-        println!(
-            "  {:>2}  {:<16}  {:>12}  {:>12}  {:>8}  {:>9}  {:>9}  {:>9}",
-            "",
-            "────────────────",
-            "────────────",
-            "────────────",
-            "────────",
-            "─────────",
-            "─────────",
-            "─────────",
-        );
-
-        for (rank, (logger, conc_ops, sat_ops, conc_p99, sat_p99)) in group.iter().enumerate() {
-            let tput_delta = (sat_ops - conc_ops) / conc_ops * 100.0;
-            let p99_spike = if *conc_p99 > 0 {
-                *sat_p99 as f64 / *conc_p99 as f64
-            } else {
-                0.0
-            };
-            println!(
-                "  {:>2}  {:<16}  {:>12}  {:>12}  {:>8}  {:>9}  {:>9}  {:>9}",
-                rank + 1,
-                logger,
-                fmt_ops(*sat_ops),
-                fmt_ops(*conc_ops),
-                format!("{:+.1}%", tput_delta),
-                fmt_latency(*sat_p99),
-                fmt_latency(*conc_p99),
-                format!("{:.1}×", p99_spike),
-            );
-        }
+        println!("{}", make_table(&headers, &rows));
     }
 
     println!("\nResults written to benchmark_results/");
