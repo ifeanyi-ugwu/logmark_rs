@@ -65,6 +65,7 @@ struct BenchmarkResult {
     elapsed: f64,
     ops: f64,
     memory_usage: f64,
+    startup_secs: f64,
     drain_secs: f64,
     target: OutputTarget,
     p50_ns: u64,
@@ -84,6 +85,7 @@ struct BenchmarkStats {
     elapsed_times: Vec<f64>,
     ops_rates: Vec<f64>,
     memory_usages: Vec<f64>,
+    startup_times: Vec<f64>,
     drain_times: Vec<f64>,
     p50_ns: Vec<u64>,
     p99_ns: Vec<u64>,
@@ -102,7 +104,7 @@ fn latency_percentiles(sorted: &[u64]) -> (u64, u64, u64, u64) {
     )
 }
 
-fn run_benchmark<F: Fn()>(name: &str, target: OutputTarget, bench_fn: F) -> BenchmarkResult {
+fn run_benchmark<F: Fn()>(name: &str, target: OutputTarget, startup_secs: f64, bench_fn: F) -> BenchmarkResult {
     // Latency pass: 10K timed individual calls, results discarded for throughput stats.
     let mut samples = vec![0u64; LATENCY_ITERATIONS];
     for slot in samples.iter_mut() {
@@ -128,6 +130,7 @@ fn run_benchmark<F: Fn()>(name: &str, target: OutputTarget, bench_fn: F) -> Benc
         elapsed: elapsed.as_secs_f64(),
         ops: ITERATIONS as f64 / elapsed.as_secs_f64(),
         memory_usage: after.saturating_sub(before) as f64 / (1024.0 * 1024.0),
+        startup_secs,
         drain_secs: 0.0,
         p50_ns: p50,
         p99_ns: p99,
@@ -189,6 +192,7 @@ fn bench_env_logger(target: OutputTarget) -> BenchmarkResult {
         )
     });
 
+    let init_start = Instant::now();
     match target {
         OutputTarget::Sink => {
             builder
@@ -205,8 +209,9 @@ fn bench_env_logger(target: OutputTarget) -> BenchmarkResult {
                 .init();
         }
     }
+    let startup_secs = init_start.elapsed().as_secs_f64();
 
-    run_benchmark("env_logger", target, || {
+    run_benchmark("env_logger", target, startup_secs, || {
         info!("{} {}", MESSAGE, "env_logger");
     })
 }
@@ -224,6 +229,7 @@ fn bench_fern(target: OutputTarget) -> BenchmarkResult {
         })
         .level(log::LevelFilter::Info);
 
+    let init_start = Instant::now();
     match target {
         OutputTarget::Sink => dispatch
             .chain(Box::new(std::io::sink()) as Box<dyn std::io::Write + Send>)
@@ -235,8 +241,9 @@ fn bench_fern(target: OutputTarget) -> BenchmarkResult {
             dispatch.chain(f).apply().unwrap()
         }
     }
+    let startup_secs = init_start.elapsed().as_secs_f64();
 
-    run_benchmark("fern", target, || {
+    run_benchmark("fern", target, startup_secs, || {
         log::info!("{} {}", MESSAGE, "fern");
     })
 }
@@ -288,6 +295,7 @@ impl<W: Write + Send + 'static> slog::Drain for PrebufDrain<W> {
 }
 
 fn bench_slog(target: OutputTarget) -> BenchmarkResult {
+    let init_start = Instant::now();
     let root = match target {
         OutputTarget::Sink => Logger::root(PrebufDrain::new(std::io::sink()).fuse(), o!()),
         OutputTarget::Stdout => Logger::root(PrebufDrain::new(std::io::stdout()).fuse(), o!()),
@@ -296,8 +304,9 @@ fn bench_slog(target: OutputTarget) -> BenchmarkResult {
             Logger::root(PrebufDrain::new(log_file).fuse(), o!())
         }
     };
+    let startup_secs = init_start.elapsed().as_secs_f64();
 
-    run_benchmark("slog", target, move || {
+    run_benchmark("slog", target, startup_secs, move || {
         slog::info!(root, "{} {}", MESSAGE, "slog");
     })
 }
@@ -315,6 +324,7 @@ fn bench_slog_async(target: OutputTarget) -> BenchmarkResult {
         };
     }
 
+    let init_start = Instant::now();
     let drain = match target {
         OutputTarget::Sink => async_drain!(std::io::sink()),
         OutputTarget::Stdout => async_drain!(std::io::stdout()),
@@ -325,6 +335,7 @@ fn bench_slog_async(target: OutputTarget) -> BenchmarkResult {
     };
 
     let root = Logger::root(drain, o!());
+    let startup_secs = init_start.elapsed().as_secs_f64();
 
     // Latency pass: enqueue latency (caller's view, no drain per call).
     let mut samples = vec![0u64; LATENCY_ITERATIONS];
@@ -354,6 +365,7 @@ fn bench_slog_async(target: OutputTarget) -> BenchmarkResult {
         elapsed: elapsed.as_secs_f64(),
         ops: ITERATIONS as f64 / elapsed.as_secs_f64(),
         memory_usage: after.saturating_sub(before) as f64 / (1024.0 * 1024.0),
+        startup_secs,
         drain_secs,
         p50_ns: p50,
         p99_ns: p99,
@@ -374,6 +386,7 @@ fn bench_tracing(target: OutputTarget) -> BenchmarkResult {
         }
     };
 
+    let init_start = Instant::now();
     let subscriber = tracing_subscriber::fmt()
         .json()
         .flatten_event(true)
@@ -381,8 +394,9 @@ fn bench_tracing(target: OutputTarget) -> BenchmarkResult {
         .finish();
 
     tracing::subscriber::set_global_default(subscriber).expect("setting tracing default failed");
+    let startup_secs = init_start.elapsed().as_secs_f64();
 
-    run_benchmark("tracing", target, || {
+    run_benchmark("tracing", target, startup_secs, || {
         event!(Level::INFO, "{} {}", MESSAGE, "tracing");
     })
 }
@@ -393,6 +407,7 @@ fn bench_tracing_async(target: OutputTarget) -> BenchmarkResult {
 
     const CHANNEL_SIZE: usize = 50_000;
 
+    let init_start = Instant::now();
     let (writer, guard) = match target {
         OutputTarget::Sink => NonBlockingBuilder::default()
             .buffered_lines_limit(CHANNEL_SIZE)
@@ -413,6 +428,7 @@ fn bench_tracing_async(target: OutputTarget) -> BenchmarkResult {
 
     let subscriber = fmt().json().flatten_event(true).with_writer(writer).finish();
     tracing::subscriber::set_global_default(subscriber).expect("setting tracing default failed");
+    let startup_secs = init_start.elapsed().as_secs_f64();
 
     // Latency pass: enqueue latency (caller's view, no drain per call).
     let mut samples = vec![0u64; LATENCY_ITERATIONS];
@@ -442,6 +458,7 @@ fn bench_tracing_async(target: OutputTarget) -> BenchmarkResult {
         elapsed: elapsed.as_secs_f64(),
         ops: ITERATIONS as f64 / elapsed.as_secs_f64(),
         memory_usage: after.saturating_sub(before) as f64 / (1024.0 * 1024.0),
+        startup_secs,
         drain_secs,
         p50_ns: p50,
         p99_ns: p99,
@@ -463,6 +480,7 @@ fn bench_winston(target: OutputTarget) -> BenchmarkResult {
             )
         })));
 
+    let init_start = Instant::now();
     let logger = match target {
         OutputTarget::Sink => builder
             .transport(winston::transports::WriterTransport::new(std::io::sink()))
@@ -477,6 +495,7 @@ fn bench_winston(target: OutputTarget) -> BenchmarkResult {
                 .build()
         }
     };
+    let startup_secs = init_start.elapsed().as_secs_f64();
 
     // Latency pass: enqueue latency (caller's view, no drain per call).
     let mut samples = vec![0u64; LATENCY_ITERATIONS];
@@ -506,6 +525,7 @@ fn bench_winston(target: OutputTarget) -> BenchmarkResult {
         elapsed: elapsed.as_secs_f64(),
         ops: ITERATIONS as f64 / elapsed.as_secs_f64(),
         memory_usage: after.saturating_sub(before) as f64 / (1024.0 * 1024.0),
+        startup_secs,
         drain_secs,
         p50_ns: p50,
         p99_ns: p99,
@@ -844,12 +864,13 @@ fn run_individual_benchmark(benchmark_name: &str, target_name: &str) -> Benchmar
     };
 
     println!(
-        "LOGMARK: {} {} {:.4} {:.4} {:.4} {:.6} {} {} {} {}",
+        "LOGMARK: {} {} {:.4} {:.4} {:.4} {:.6} {:.6} {} {} {} {}",
         result.name,
         result.target.as_str(),
         result.elapsed,
         result.ops,
         result.memory_usage,
+        result.startup_secs,
         result.drain_secs,
         result.p50_ns,
         result.p99_ns,
@@ -927,21 +948,23 @@ fn run_benchmarks_in_processes(
                 if let Some(line) = output_str.lines().find(|l| l.starts_with("LOGMARK: ")) {
                     let result_parts: Vec<&str> =
                         line["LOGMARK: ".len()..].split_whitespace().collect();
-                    if result_parts.len() >= 10 {
+                    if result_parts.len() >= 11 {
                         let name = format!("{}_{}", result_parts[0], result_parts[1]);
                         let elapsed: f64 = result_parts[2].parse().unwrap();
                         let ops: f64 = result_parts[3].parse().unwrap();
                         let memory: f64 = result_parts[4].parse().unwrap();
-                        let drain: f64 = result_parts[5].parse().unwrap();
-                        let p50: u64 = result_parts[6].parse().unwrap();
-                        let p99: u64 = result_parts[7].parse().unwrap();
-                        let p999: u64 = result_parts[8].parse().unwrap();
-                        let max: u64 = result_parts[9].parse().unwrap();
+                        let startup: f64 = result_parts[5].parse().unwrap();
+                        let drain: f64 = result_parts[6].parse().unwrap();
+                        let p50: u64 = result_parts[7].parse().unwrap();
+                        let p99: u64 = result_parts[8].parse().unwrap();
+                        let p999: u64 = result_parts[9].parse().unwrap();
+                        let max: u64 = result_parts[10].parse().unwrap();
 
                         let stats = results.entry(name.clone()).or_default();
                         stats.elapsed_times.push(elapsed);
                         stats.ops_rates.push(ops);
                         stats.memory_usages.push(memory);
+                        stats.startup_times.push(startup);
                         stats.drain_times.push(drain);
                         stats.p50_ns.push(p50);
                         stats.p99_ns.push(p99);
@@ -1215,11 +1238,12 @@ fn print_stats_report(
         };
         writeln!(
             detail,
-            "  median={:.4}s  ±{:.0}%{}  heap=+{}{}",
+            "  median={:.4}s  ±{:.0}%{}  heap=+{}  init={:.4}s{}",
             median(&stat.elapsed_times),
             c * 100.0,
             flag,
             fmt_mem(median(&stat.memory_usages)),
+            median(&stat.startup_times),
             drain_part,
         )
         .unwrap();
@@ -1251,12 +1275,12 @@ fn print_stats_report(
 
         println!("\n  ── {} ", target.to_uppercase());
         println!(
-            "  {:>2}  {:<16}  {:>12}  {:>11}  {:>7}  {:<3}  {:>8}",
-            "#", "logger", "median ops/s", "median time", "vs best", "var", "drain"
+            "  {:>2}  {:<16}  {:>12}  {:>11}  {:>7}  {:<3}  {:>8}  {:>8}",
+            "#", "logger", "median ops/s", "median time", "vs best", "var", "init", "drain"
         );
         println!(
-            "  {:>2}  {:<16}  {:>12}  {:>11}  {:>7}  {:<3}  {:>8}",
-            "", "────────────────", "────────────", "───────────", "───────", "───", "────────"
+            "  {:>2}  {:<16}  {:>12}  {:>11}  {:>7}  {:<3}  {:>8}  {:>8}",
+            "", "────────────────", "────────────", "───────────", "───────", "───", "────────", "────────"
         );
 
         let mut any_flagged = false;
@@ -1269,13 +1293,14 @@ fn print_stats_report(
             if c > 0.25 {
                 any_flagged = true;
             }
+            let init_str = format!("{:.4}s", median(&stat.startup_times));
             let drain_str = if stat.drain_times.iter().all(|&d| d == 0.0) {
                 "-".to_string()
             } else {
                 format!("{:.4}s", median(&stat.drain_times))
             };
             println!(
-                "  {:>2}  {:<16}  {:>12}  {:>11}  {:>7}  ±{:.0}%{}  {:>8}",
+                "  {:>2}  {:<16}  {:>12}  {:>11}  {:>7}  ±{:.0}%{}  {:>8}  {:>8}",
                 rank + 1,
                 logger,
                 fmt_ops(med_ops),
@@ -1283,6 +1308,7 @@ fn print_stats_report(
                 format!("{:.1}×", vs),
                 c * 100.0,
                 flag,
+                init_str,
                 drain_str,
             );
         }
@@ -1302,14 +1328,14 @@ fn print_stats_report(
         .unwrap();
         writeln!(
             f,
-            "  {:>2}  {:<16}  {:>12}  {:>11}  {:>7}  {:<3}  {:>8}",
-            "#", "logger", "median ops/s", "median time", "vs best", "var", "drain"
+            "  {:>2}  {:<16}  {:>12}  {:>11}  {:>7}  {:<3}  {:>8}  {:>8}",
+            "#", "logger", "median ops/s", "median time", "vs best", "var", "init", "drain"
         )
         .unwrap();
         writeln!(
             f,
-            "  {:>2}  {:<16}  {:>12}  {:>11}  {:>7}  {:<3}  {:>8}",
-            "", "────────────────", "────────────", "───────────", "───────", "───", "────────"
+            "  {:>2}  {:<16}  {:>12}  {:>11}  {:>7}  {:<3}  {:>8}  {:>8}",
+            "", "────────────────", "────────────", "───────────", "───────", "───", "────────", "────────"
         )
         .unwrap();
         for (rank, (logger, stat)) in group.iter().enumerate() {
@@ -1318,6 +1344,7 @@ fn print_stats_report(
             let vs = best_ops / med_ops;
             let c = cov(&stat.elapsed_times);
             let flag = if c > 0.25 { " [!]" } else { "" };
+            let init_str = format!("{:.4}s", median(&stat.startup_times));
             let drain_str = if stat.drain_times.iter().all(|&d| d == 0.0) {
                 "-".to_string()
             } else {
@@ -1325,7 +1352,7 @@ fn print_stats_report(
             };
             writeln!(
                 f,
-                "  {:>2}  {:<16}  {:>12}  {:>11}  {:>7}  ±{:.0}%{}  {:>8}",
+                "  {:>2}  {:<16}  {:>12}  {:>11}  {:>7}  ±{:.0}%{}  {:>8}  {:>8}",
                 rank + 1,
                 logger,
                 fmt_ops(med_ops),
@@ -1333,6 +1360,7 @@ fn print_stats_report(
                 format!("{:.1}×", vs),
                 c * 100.0,
                 flag,
+                init_str,
                 drain_str,
             )
             .unwrap();
