@@ -65,6 +65,7 @@ struct BenchmarkResult {
     elapsed: f64,
     ops: f64,
     memory_usage: f64,
+    drain_secs: f64,
     target: OutputTarget,
     p50_ns: u64,
     p99_ns: u64,
@@ -83,6 +84,7 @@ struct BenchmarkStats {
     elapsed_times: Vec<f64>,
     ops_rates: Vec<f64>,
     memory_usages: Vec<f64>,
+    drain_times: Vec<f64>,
     p50_ns: Vec<u64>,
     p99_ns: Vec<u64>,
     p999_ns: Vec<u64>,
@@ -126,6 +128,7 @@ fn run_benchmark<F: Fn()>(name: &str, target: OutputTarget, bench_fn: F) -> Benc
         elapsed: elapsed.as_secs_f64(),
         ops: ITERATIONS as f64 / elapsed.as_secs_f64(),
         memory_usage: after.saturating_sub(before) as f64 / (1024.0 * 1024.0),
+        drain_secs: 0.0,
         p50_ns: p50,
         p99_ns: p99,
         p999_ns: p999,
@@ -339,7 +342,9 @@ fn bench_slog_async(target: OutputTarget) -> BenchmarkResult {
     for _ in 0..ITERATIONS {
         slog::info!(root, "{} {}", MESSAGE, "slog_async");
     }
+    let drain_start = Instant::now();
     drop(root);
+    let drain_secs = drain_start.elapsed().as_secs_f64();
     let elapsed = start.elapsed();
     let after = jemalloc_allocated();
 
@@ -349,6 +354,7 @@ fn bench_slog_async(target: OutputTarget) -> BenchmarkResult {
         elapsed: elapsed.as_secs_f64(),
         ops: ITERATIONS as f64 / elapsed.as_secs_f64(),
         memory_usage: after.saturating_sub(before) as f64 / (1024.0 * 1024.0),
+        drain_secs,
         p50_ns: p50,
         p99_ns: p99,
         p999_ns: p999,
@@ -424,7 +430,9 @@ fn bench_tracing_async(target: OutputTarget) -> BenchmarkResult {
     for _ in 0..ITERATIONS {
         event!(Level::INFO, "{} {}", MESSAGE, "tracing_async");
     }
+    let drain_start = Instant::now();
     drop(guard);
+    let drain_secs = drain_start.elapsed().as_secs_f64();
     let elapsed = start.elapsed();
     let after = jemalloc_allocated();
 
@@ -434,6 +442,7 @@ fn bench_tracing_async(target: OutputTarget) -> BenchmarkResult {
         elapsed: elapsed.as_secs_f64(),
         ops: ITERATIONS as f64 / elapsed.as_secs_f64(),
         memory_usage: after.saturating_sub(before) as f64 / (1024.0 * 1024.0),
+        drain_secs,
         p50_ns: p50,
         p99_ns: p99,
         p999_ns: p999,
@@ -485,7 +494,9 @@ fn bench_winston(target: OutputTarget) -> BenchmarkResult {
     for _ in 0..ITERATIONS {
         winston::log!(logger, info, format!("{} {}", MESSAGE, "winston"));
     }
+    let drain_start = Instant::now();
     drop(logger);
+    let drain_secs = drain_start.elapsed().as_secs_f64();
     let elapsed = start.elapsed();
     let after = jemalloc_allocated();
 
@@ -495,6 +506,7 @@ fn bench_winston(target: OutputTarget) -> BenchmarkResult {
         elapsed: elapsed.as_secs_f64(),
         ops: ITERATIONS as f64 / elapsed.as_secs_f64(),
         memory_usage: after.saturating_sub(before) as f64 / (1024.0 * 1024.0),
+        drain_secs,
         p50_ns: p50,
         p99_ns: p99,
         p999_ns: p999,
@@ -832,12 +844,13 @@ fn run_individual_benchmark(benchmark_name: &str, target_name: &str) -> Benchmar
     };
 
     println!(
-        "LOGMARK: {} {} {:.4} {:.4} {:.4} {} {} {} {}",
+        "LOGMARK: {} {} {:.4} {:.4} {:.4} {:.6} {} {} {} {}",
         result.name,
         result.target.as_str(),
         result.elapsed,
         result.ops,
         result.memory_usage,
+        result.drain_secs,
         result.p50_ns,
         result.p99_ns,
         result.p999_ns,
@@ -914,20 +927,22 @@ fn run_benchmarks_in_processes(
                 if let Some(line) = output_str.lines().find(|l| l.starts_with("LOGMARK: ")) {
                     let result_parts: Vec<&str> =
                         line["LOGMARK: ".len()..].split_whitespace().collect();
-                    if result_parts.len() >= 9 {
+                    if result_parts.len() >= 10 {
                         let name = format!("{}_{}", result_parts[0], result_parts[1]);
                         let elapsed: f64 = result_parts[2].parse().unwrap();
                         let ops: f64 = result_parts[3].parse().unwrap();
                         let memory: f64 = result_parts[4].parse().unwrap();
-                        let p50: u64 = result_parts[5].parse().unwrap();
-                        let p99: u64 = result_parts[6].parse().unwrap();
-                        let p999: u64 = result_parts[7].parse().unwrap();
-                        let max: u64 = result_parts[8].parse().unwrap();
+                        let drain: f64 = result_parts[5].parse().unwrap();
+                        let p50: u64 = result_parts[6].parse().unwrap();
+                        let p99: u64 = result_parts[7].parse().unwrap();
+                        let p999: u64 = result_parts[8].parse().unwrap();
+                        let max: u64 = result_parts[9].parse().unwrap();
 
                         let stats = results.entry(name.clone()).or_default();
                         stats.elapsed_times.push(elapsed);
                         stats.ops_rates.push(ops);
                         stats.memory_usages.push(memory);
+                        stats.drain_times.push(drain);
                         stats.p50_ns.push(p50);
                         stats.p99_ns.push(p99);
                         stats.p999_ns.push(p999);
@@ -1193,13 +1208,19 @@ fn print_stats_report(
         for (i, t) in stat.elapsed_times.iter().enumerate() {
             write!(detail, "  run{}={:.4}s", i + 1, t).unwrap();
         }
+        let drain_part = if stat.drain_times.iter().all(|&d| d == 0.0) {
+            String::new()
+        } else {
+            format!("  drain={:.4}s", median(&stat.drain_times))
+        };
         writeln!(
             detail,
-            "  median={:.4}s  ±{:.0}%{}  heap=+{}",
+            "  median={:.4}s  ±{:.0}%{}  heap=+{}{}",
             median(&stat.elapsed_times),
             c * 100.0,
             flag,
             fmt_mem(median(&stat.memory_usages)),
+            drain_part,
         )
         .unwrap();
     }
@@ -1230,12 +1251,12 @@ fn print_stats_report(
 
         println!("\n  ── {} ", target.to_uppercase());
         println!(
-            "  {:>2}  {:<16}  {:>12}  {:>11}  {:>7}  {}",
-            "#", "logger", "median ops/s", "median time", "vs best", "var"
+            "  {:>2}  {:<16}  {:>12}  {:>11}  {:>7}  {:<3}  {:>8}",
+            "#", "logger", "median ops/s", "median time", "vs best", "var", "drain"
         );
         println!(
-            "  {:>2}  {:<16}  {:>12}  {:>11}  {:>7}  {}",
-            "", "────────────────", "────────────", "───────────", "───────", "───"
+            "  {:>2}  {:<16}  {:>12}  {:>11}  {:>7}  {:<3}  {:>8}",
+            "", "────────────────", "────────────", "───────────", "───────", "───", "────────"
         );
 
         let mut any_flagged = false;
@@ -1248,8 +1269,13 @@ fn print_stats_report(
             if c > 0.25 {
                 any_flagged = true;
             }
+            let drain_str = if stat.drain_times.iter().all(|&d| d == 0.0) {
+                "-".to_string()
+            } else {
+                format!("{:.4}s", median(&stat.drain_times))
+            };
             println!(
-                "  {:>2}  {:<16}  {:>12}  {:>11}  {:>7}  ±{:.0}%{}",
+                "  {:>2}  {:<16}  {:>12}  {:>11}  {:>7}  ±{:.0}%{}  {:>8}",
                 rank + 1,
                 logger,
                 fmt_ops(med_ops),
@@ -1257,6 +1283,7 @@ fn print_stats_report(
                 format!("{:.1}×", vs),
                 c * 100.0,
                 flag,
+                drain_str,
             );
         }
 
@@ -1275,14 +1302,14 @@ fn print_stats_report(
         .unwrap();
         writeln!(
             f,
-            "  {:>2}  {:<16}  {:>12}  {:>11}  {:>7}  {}",
-            "#", "logger", "median ops/s", "median time", "vs best", "var"
+            "  {:>2}  {:<16}  {:>12}  {:>11}  {:>7}  {:<3}  {:>8}",
+            "#", "logger", "median ops/s", "median time", "vs best", "var", "drain"
         )
         .unwrap();
         writeln!(
             f,
-            "  {:>2}  {:<16}  {:>12}  {:>11}  {:>7}  {}",
-            "", "────────────────", "────────────", "───────────", "───────", "───"
+            "  {:>2}  {:<16}  {:>12}  {:>11}  {:>7}  {:<3}  {:>8}",
+            "", "────────────────", "────────────", "───────────", "───────", "───", "────────"
         )
         .unwrap();
         for (rank, (logger, stat)) in group.iter().enumerate() {
@@ -1291,9 +1318,14 @@ fn print_stats_report(
             let vs = best_ops / med_ops;
             let c = cov(&stat.elapsed_times);
             let flag = if c > 0.25 { " [!]" } else { "" };
+            let drain_str = if stat.drain_times.iter().all(|&d| d == 0.0) {
+                "-".to_string()
+            } else {
+                format!("{:.4}s", median(&stat.drain_times))
+            };
             writeln!(
                 f,
-                "  {:>2}  {:<16}  {:>12}  {:>11}  {:>7}  ±{:.0}%{}",
+                "  {:>2}  {:<16}  {:>12}  {:>11}  {:>7}  ±{:.0}%{}  {:>8}",
                 rank + 1,
                 logger,
                 fmt_ops(med_ops),
@@ -1301,6 +1333,7 @@ fn print_stats_report(
                 format!("{:.1}×", vs),
                 c * 100.0,
                 flag,
+                drain_str,
             )
             .unwrap();
         }
