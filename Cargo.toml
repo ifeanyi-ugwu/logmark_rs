@@ -18,8 +18,7 @@ slog-term = "2.9.1"
 tracing = "0.1.40"
 tracing-appender = "0.2.3"
 tracing-subscriber = { version = "0.3", features = ["fmt", "json"] }
-winston = { version = "0.8.0", path = "../winston_logger/winston" }
-winston_transport = "0.6.0"
+winston = { git = "https://github.com/ifeanyi-ugwu/winston_logger_rs", rev = "e4a20c792aa34635c65221a4e4ddcba3ee485a9c" }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.6.0"
